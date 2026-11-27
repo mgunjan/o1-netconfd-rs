@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
 pub const DEMO_NS: &str = "urn:demo:o1:nrcelldu";
+pub const OCU_NRM_NS: &str = "urn:3gpp:sa5:_3gpp-nr-nrm-nrcellcu";
 pub const PROVENANCE_NS: &str = "urn:o1:provenance:1.0";
 pub const NOTIF_WRAP_NS: &str = "urn:ietf:params:xml:ns:netconf:notification:1.0";
 pub const REPLAY_MOD_NS: &str = "urn:ietf:params:xml:ns:netmod:notification";
@@ -87,20 +88,116 @@ pub enum ChangedBy {
     },
 }
 
-/// Optional IETF transaction-id and W3C traceparent propagated on NETCONF write RPCs.
+/// Origin loop that authored a configuration transition across O-RAN control timescales.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WriterOrigin {
+    #[default]
+    O1Client,
+    ServerRollback,
+    E2Xapp,
+    GpuDapp,
+}
+
+impl WriterOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::O1Client => "o1-client",
+            Self::ServerRollback => "server-rollback",
+            Self::E2Xapp => "e2-xapp",
+            Self::GpuDapp => "gpu-dapp",
+        }
+    }
+
+    pub fn parse_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "o1-client" | "o1_client" | "o1" => Some(Self::O1Client),
+            "server-rollback" | "server_rollback" | "server" => Some(Self::ServerRollback),
+            "e2-xapp" | "e2_xapp" | "e2" => Some(Self::E2Xapp),
+            "gpu-dapp" | "gpu_dapp" | "dapp" => Some(Self::GpuDapp),
+            _ => None,
+        }
+    }
+}
+
+/// Supported 3GPP TS 28.541 O-DU / O-CU NRM managed functions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ManagedFunctionKind {
+    GNBCUCPFunction,
+    GNBCUUPFunction,
+    NRCellCU,
+    NRCellDU,
+}
+
+impl ManagedFunctionKind {
+    pub fn xml_tag(&self) -> &'static str {
+        match self {
+            Self::GNBCUCPFunction => "GNBCUCPFunction",
+            Self::GNBCUUPFunction => "GNBCUUPFunction",
+            Self::NRCellCU => "NRCellCU",
+            Self::NRCellDU => "NRCellDU",
+        }
+    }
+
+    pub fn module_prefix(&self) -> &'static str {
+        match self {
+            Self::NRCellDU => "/demo-nrcelldu:managed-element",
+            _ => "/_3gpp-nr-nrm-nrcellcu:ManagedElement",
+        }
+    }
+}
+
+/// Optional GPU AI-RAN operational & policy attributes on O-DU/O-CU managed functions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedAttributes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub administrative_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_accelerator_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_rrm_policy_id: Option<String>,
+}
+
+/// Persisted O-CU managed function record (`GNBCUCPFunction`, `GNBCUUPFunction`, `NRCellCU`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuObjectRecord {
+    pub kind: ManagedFunctionKind,
+    pub id: String,
+    #[serde(default)]
+    pub attrs: ManagedAttributes,
+}
+
+/// Parsed edit payload targeting an O-DU or O-CU managed function.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectEdit {
+    pub kind: ManagedFunctionKind,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub administrative_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_accelerator_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_rrm_policy_id: Option<String>,
+}
+
+/// Optional IETF transaction-id, W3C traceparent, and control-loop `writer-origin`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriteMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
+    #[serde(default)]
+    pub writer_origin: WriterOrigin,
 }
 
-/// Per-cell RFC 7952 causal ownership metadata persisted alongside running state.
+/// Per-leaf RFC 7952 causal ownership metadata persisted alongside running state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LeafProvenance {
     pub owner_principal: String,
     pub owner_session_id: u64,
+    #[serde(default)]
+    pub writer_origin: WriterOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tx_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -114,6 +211,8 @@ pub enum NotificationPayload {
         changed_by: ChangedBy,
         datastore: String,
         targets: Vec<String>,
+        #[serde(default)]
+        writer_origin: WriterOrigin,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tx_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +254,7 @@ impl NotificationRecord {
                 changed_by,
                 datastore,
                 targets,
+                writer_origin,
                 tx_id,
                 traceparent,
             } => {
@@ -181,6 +281,7 @@ impl NotificationRecord {
                     .iter()
                     .map(|t| format!("<edit><target>{}</target><operation>replace</operation></edit>", xml_escape(t)))
                     .collect();
+                let wo_xml = format!("<writer-origin>{}</writer-origin>", writer_origin.as_str());
                 let tx_xml = tx_id
                     .as_ref()
                     .map(|t| format!("<tx-id>{}</tx-id>", xml_escape(t)))
@@ -190,7 +291,7 @@ impl NotificationRecord {
                     .map(|t| format!("<traceparent>{}</traceparent>", xml_escape(t)))
                     .unwrap_or_default();
                 format!(
-                    "<netconf-config-change xmlns=\"{RFC6470_NS}\">{cb_xml}<datastore>{}</datastore>{edits_xml}{tx_xml}{tp_xml}</netconf-config-change>",
+                    "<netconf-config-change xmlns=\"{RFC6470_NS}\">{cb_xml}<datastore>{}</datastore>{edits_xml}{wo_xml}{tx_xml}{tp_xml}</netconf-config-change>",
                     xml_escape(datastore)
                 )
             }
@@ -229,6 +330,10 @@ pub enum PendingCommitState {
         deadline_ms: i64,
         rollback_cells: BTreeMap<String, String>,
         #[serde(default)]
+        rollback_du_ext: BTreeMap<String, ManagedAttributes>,
+        #[serde(default)]
+        rollback_cu_objects: BTreeMap<String, CuObjectRecord>,
+        #[serde(default)]
         rollback_provenance: BTreeMap<String, LeafProvenance>,
     },
 }
@@ -237,6 +342,10 @@ pub enum PendingCommitState {
 pub struct PersistedStore {
     pub next_session_id: u64,
     pub running_cells: BTreeMap<String, String>,
+    #[serde(default)]
+    pub running_du_ext: BTreeMap<String, ManagedAttributes>,
+    #[serde(default)]
+    pub running_cu_objects: BTreeMap<String, CuObjectRecord>,
     #[serde(default)]
     pub running_provenance: BTreeMap<String, LeafProvenance>,
     pub pending_commit: PendingCommitState,
@@ -250,6 +359,8 @@ impl Default for PersistedStore {
         Self {
             next_session_id: 1,
             running_cells,
+            running_du_ext: BTreeMap::new(),
+            running_cu_objects: BTreeMap::new(),
             running_provenance: BTreeMap::new(),
             pending_commit: PendingCommitState::Idle,
             notifications: Vec::new(),
@@ -260,6 +371,8 @@ impl Default for PersistedStore {
 struct InnerState {
     persisted: PersistedStore,
     candidate_cells: BTreeMap<String, String>,
+    candidate_du_ext: BTreeMap<String, ManagedAttributes>,
+    candidate_cu_objects: BTreeMap<String, CuObjectRecord>,
     candidate_provenance: BTreeMap<String, LeafProvenance>,
     candidate_dirty: std::collections::BTreeSet<String>,
     candidate_lock: Option<u64>,
@@ -314,18 +427,43 @@ impl DatastoreEngine {
         // Crash / restart recovery: atomic rollback + PendingCommitState::Idle clearing
         if let PendingCommitState::Pending {
             rollback_cells,
+            rollback_du_ext,
+            rollback_cu_objects,
             rollback_provenance,
             owner_user,
             owner_session_id,
             ..
         } = persisted.pending_commit.clone()
         {
-            let changed_targets = diff_cell_targets(&persisted.running_cells, &rollback_cells);
+            let changed_leaves = diff_changed_leaves(
+                &persisted.running_cells,
+                &persisted.running_du_ext,
+                &persisted.running_cu_objects,
+                &rollback_cells,
+                &rollback_du_ext,
+                &rollback_cu_objects,
+            );
             persisted.running_cells = rollback_cells;
+            persisted.running_du_ext = rollback_du_ext;
+            persisted.running_cu_objects = rollback_cu_objects;
             persisted.running_provenance = rollback_provenance;
             persisted.pending_commit = PendingCommitState::Idle;
 
             let now = Utc::now();
+            for (prov_key, _) in &changed_leaves {
+                persisted
+                    .running_provenance
+                    .entry(prov_key.clone())
+                    .or_insert_with(|| LeafProvenance {
+                        owner_principal: "server".to_string(),
+                        owner_session_id: 0,
+                        writer_origin: WriterOrigin::ServerRollback,
+                        tx_id: None,
+                        traceparent: None,
+                        updated_at: now,
+                    });
+            }
+
             append_notification(
                 &mut persisted,
                 now,
@@ -335,7 +473,9 @@ impl DatastoreEngine {
                     session_id: Some(owner_session_id),
                 },
             );
-            if !changed_targets.is_empty() {
+            if !changed_leaves.is_empty() {
+                let changed_targets: Vec<String> =
+                    changed_leaves.into_iter().map(|(_, p)| p).collect();
                 append_notification(
                     &mut persisted,
                     now,
@@ -343,6 +483,7 @@ impl DatastoreEngine {
                         changed_by: ChangedBy::Server,
                         datastore: "running".to_string(),
                         targets: changed_targets,
+                        writer_origin: WriterOrigin::ServerRollback,
                         tx_id: None,
                         traceparent: None,
                     },
@@ -376,6 +517,8 @@ impl DatastoreEngine {
 
         let startup_events = Arc::new(persisted.notifications[pre_recovery_len..].to_vec());
         let candidate_cells = persisted.running_cells.clone();
+        let candidate_du_ext = persisted.running_du_ext.clone();
+        let candidate_cu_objects = persisted.running_cu_objects.clone();
         let candidate_provenance = persisted.running_provenance.clone();
         let (notif_tx, _) = broadcast::channel(256);
         let engine = Self {
@@ -384,6 +527,8 @@ impl DatastoreEngine {
             inner: Arc::new(Mutex::new(InnerState {
                 persisted,
                 candidate_cells,
+                candidate_du_ext,
+                candidate_cu_objects,
                 candidate_provenance,
                 candidate_dirty: std::collections::BTreeSet::new(),
                 candidate_lock: None,
@@ -483,6 +628,8 @@ impl DatastoreEngine {
         if let PendingCommitState::Pending {
             deadline_ms,
             rollback_cells,
+            rollback_du_ext,
+            rollback_cu_objects,
             rollback_provenance,
             owner_user,
             owner_session_id,
@@ -491,17 +638,43 @@ impl DatastoreEngine {
         {
             if now_ms >= deadline_ms {
                 let prev_len = guard.persisted.notifications.len();
-                let changed_targets = diff_cell_targets(&guard.persisted.running_cells, &rollback_cells);
+                let changed_leaves = diff_changed_leaves(
+                    &guard.persisted.running_cells,
+                    &guard.persisted.running_du_ext,
+                    &guard.persisted.running_cu_objects,
+                    &rollback_cells,
+                    &rollback_du_ext,
+                    &rollback_cu_objects,
+                );
+                let now = Utc::now();
                 guard.persisted.running_cells = rollback_cells.clone();
+                guard.persisted.running_du_ext = rollback_du_ext.clone();
+                guard.persisted.running_cu_objects = rollback_cu_objects.clone();
                 guard.persisted.running_provenance = rollback_provenance.clone();
+                for (prov_key, _) in &changed_leaves {
+                    guard
+                        .persisted
+                        .running_provenance
+                        .entry(prov_key.clone())
+                        .or_insert_with(|| LeafProvenance {
+                            owner_principal: "server".to_string(),
+                            owner_session_id: 0,
+                            writer_origin: WriterOrigin::ServerRollback,
+                            tx_id: None,
+                            traceparent: None,
+                            updated_at: now,
+                        });
+                }
                 guard.candidate_cells = rollback_cells;
-                guard.candidate_provenance = rollback_provenance;
+                guard.candidate_du_ext = rollback_du_ext;
+                guard.candidate_cu_objects = rollback_cu_objects;
+                guard.candidate_provenance = guard.persisted.running_provenance.clone();
                 guard.candidate_dirty.clear();
                 guard.persisted.pending_commit = PendingCommitState::Idle;
 
                 let ev1 = append_notification(
                     &mut guard.persisted,
-                    Utc::now(),
+                    now,
                     NotificationPayload::ConfirmedCommit {
                         confirm_event: "timeout".to_string(),
                         username: Some(owner_user),
@@ -510,14 +683,17 @@ impl DatastoreEngine {
                 );
                 let _ = self.notif_tx.send(ev1);
 
-                if !changed_targets.is_empty() {
+                if !changed_leaves.is_empty() {
+                    let changed_targets: Vec<String> =
+                        changed_leaves.into_iter().map(|(_, p)| p).collect();
                     let ev2 = append_notification(
                         &mut guard.persisted,
-                        Utc::now(),
+                        now,
                         NotificationPayload::ConfigChange {
                             changed_by: ChangedBy::Server,
                             datastore: "running".to_string(),
                             targets: changed_targets,
+                            writer_origin: WriterOrigin::ServerRollback,
                             tx_id: None,
                             traceparent: None,
                         },
@@ -552,6 +728,8 @@ impl DatastoreEngine {
             persist_id: None,
             owner_session_id,
             rollback_cells,
+            rollback_du_ext,
+            rollback_cu_objects,
             rollback_provenance,
             owner_user,
             ..
@@ -559,16 +737,42 @@ impl DatastoreEngine {
         {
             if owner_session_id == session_id {
                 let prev_len = guard.persisted.notifications.len();
-                let changed_targets = diff_cell_targets(&guard.persisted.running_cells, &rollback_cells);
+                let changed_leaves = diff_changed_leaves(
+                    &guard.persisted.running_cells,
+                    &guard.persisted.running_du_ext,
+                    &guard.persisted.running_cu_objects,
+                    &rollback_cells,
+                    &rollback_du_ext,
+                    &rollback_cu_objects,
+                );
+                let now = Utc::now();
                 guard.persisted.running_cells = rollback_cells.clone();
+                guard.persisted.running_du_ext = rollback_du_ext.clone();
+                guard.persisted.running_cu_objects = rollback_cu_objects.clone();
                 guard.persisted.running_provenance = rollback_provenance.clone();
+                for (prov_key, _) in &changed_leaves {
+                    guard
+                        .persisted
+                        .running_provenance
+                        .entry(prov_key.clone())
+                        .or_insert_with(|| LeafProvenance {
+                            owner_principal: "server".to_string(),
+                            owner_session_id: 0,
+                            writer_origin: WriterOrigin::ServerRollback,
+                            tx_id: None,
+                            traceparent: None,
+                            updated_at: now,
+                        });
+                }
                 guard.candidate_cells = rollback_cells;
-                guard.candidate_provenance = rollback_provenance;
+                guard.candidate_du_ext = rollback_du_ext;
+                guard.candidate_cu_objects = rollback_cu_objects;
+                guard.candidate_provenance = guard.persisted.running_provenance.clone();
                 guard.candidate_dirty.clear();
                 guard.persisted.pending_commit = PendingCommitState::Idle;
                 let ev1 = append_notification(
                     &mut guard.persisted,
-                    Utc::now(),
+                    now,
                     NotificationPayload::ConfirmedCommit {
                         confirm_event: "cancel".to_string(),
                         username: Some(owner_user),
@@ -576,14 +780,17 @@ impl DatastoreEngine {
                     },
                 );
                 let _ = self.notif_tx.send(ev1);
-                if !changed_targets.is_empty() {
+                if !changed_leaves.is_empty() {
+                    let changed_targets: Vec<String> =
+                        changed_leaves.into_iter().map(|(_, p)| p).collect();
                     let ev2 = append_notification(
                         &mut guard.persisted,
-                        Utc::now(),
+                        now,
                         NotificationPayload::ConfigChange {
                             changed_by: ChangedBy::Server,
                             datastore: "running".to_string(),
                             targets: changed_targets,
+                            writer_origin: WriterOrigin::ServerRollback,
                             tx_id: None,
                             traceparent: None,
                         },
@@ -606,13 +813,25 @@ impl DatastoreEngine {
         with_provenance: bool,
     ) -> Result<String, NetconfError> {
         let guard = self.inner.lock().await;
-        let (map, prov) = match source {
-            "running" => (&guard.persisted.running_cells, &guard.persisted.running_provenance),
-            "candidate" => (&guard.candidate_cells, &guard.candidate_provenance),
+        let (du, du_ext, cu, prov) = match source {
+            "running" => (
+                &guard.persisted.running_cells,
+                &guard.persisted.running_du_ext,
+                &guard.persisted.running_cu_objects,
+                &guard.persisted.running_provenance,
+            ),
+            "candidate" => (
+                &guard.candidate_cells,
+                &guard.candidate_du_ext,
+                &guard.candidate_cu_objects,
+                &guard.candidate_provenance,
+            ),
             other => return Err(NetconfError::invalid_value(format!("Unsupported datastore: {other}"))),
         };
-        Ok(render_cells_xml_with_provenance(
-            map,
+        Ok(render_datastore_xml_with_provenance(
+            du,
+            du_ext,
+            cu,
             if with_provenance { Some(prov) } else { None },
         ))
     }
@@ -659,6 +878,8 @@ impl DatastoreEngine {
             }
         }
         guard.candidate_cells = guard.persisted.running_cells.clone();
+        guard.candidate_du_ext = guard.persisted.running_du_ext.clone();
+        guard.candidate_cu_objects = guard.persisted.running_cu_objects.clone();
         guard.candidate_provenance = guard.persisted.running_provenance.clone();
         guard.candidate_dirty.clear();
         Ok(())
@@ -696,20 +917,46 @@ impl DatastoreEngine {
         source_host: Option<String>,
         meta: WriteMeta,
     ) -> Result<(), NetconfError> {
-        if !matches!(admin_state, "LOCKED" | "UNLOCKED" | "SHUTTINGDOWN") {
-            return Err(NetconfError::invalid_value(format!(
-                "Invalid administrativeState: {admin_state}"
-            )));
+        let edit = ObjectEdit {
+            kind: ManagedFunctionKind::NRCellDU,
+            id: cell_id.to_string(),
+            administrative_state: Some(admin_state.to_string()),
+            gpu_accelerator_profile: None,
+            ai_rrm_policy_id: None,
+        };
+        self.edit_objects_with_meta(target, &[edit], username, session_id, source_host, meta)
+            .await
+    }
+
+    /// Apply one or more O-DU / O-CU managed-object edits to `candidate` or `running`
+    /// with per-leaf causal provenance (`owner_principal`, `session_id`, `writer_origin`, `tx_id`, `traceparent`).
+    pub async fn edit_objects_with_meta(
+        &self,
+        target: &str,
+        edits: &[ObjectEdit],
+        username: &str,
+        session_id: u64,
+        source_host: Option<String>,
+        meta: WriteMeta,
+    ) -> Result<(), NetconfError> {
+        if edits.is_empty() {
+            return Err(NetconfError::invalid_value("Missing managed object edits in edit-config"));
         }
+        for edit in edits {
+            validate_object_edit(edit)?;
+        }
+
         let mut guard = self.inner.lock().await;
         let now = Utc::now();
         let prov = LeafProvenance {
             owner_principal: username.to_string(),
             owner_session_id: session_id,
+            writer_origin: meta.writer_origin,
             tx_id: meta.tx_id.clone(),
             traceparent: meta.traceparent.clone(),
             updated_at: now,
         };
+
         match target {
             "candidate" => {
                 if let Some(holder) = guard.candidate_lock {
@@ -717,9 +964,7 @@ impl DatastoreEngine {
                         return Err(NetconfError::lock_denied("Candidate datastore is locked"));
                     }
                 }
-                guard.candidate_cells.insert(cell_id.to_string(), admin_state.to_string());
-                guard.candidate_provenance.insert(cell_id.to_string(), prov);
-                guard.candidate_dirty.insert(cell_id.to_string());
+                apply_edits_to_candidate(&mut guard, edits, &prov);
                 Ok(())
             }
             "running" => {
@@ -729,25 +974,25 @@ impl DatastoreEngine {
                     }
                 }
                 let prev_len = guard.persisted.notifications.len();
-                let prev = guard.persisted.running_cells.get(cell_id).cloned();
-                guard.persisted.running_cells.insert(cell_id.to_string(), admin_state.to_string());
-                guard.persisted.running_provenance.insert(cell_id.to_string(), prov.clone());
-                guard.candidate_cells.insert(cell_id.to_string(), admin_state.to_string());
-                guard.candidate_provenance.insert(cell_id.to_string(), prov);
-                guard.candidate_dirty.remove(cell_id);
-
-                if prev.as_deref() != Some(admin_state) {
+                let changed_targets = apply_edits_to_running(&mut guard, edits, &prov);
+                if !changed_targets.is_empty() {
+                    let changed_by = if session_id == 0 {
+                        ChangedBy::Server
+                    } else {
+                        ChangedBy::Session {
+                            username: username.to_string(),
+                            session_id,
+                            source_host,
+                        }
+                    };
                     let ev = append_notification(
                         &mut guard.persisted,
                         now,
                         NotificationPayload::ConfigChange {
-                            changed_by: ChangedBy::Session {
-                                username: username.to_string(),
-                                session_id,
-                                source_host,
-                            },
+                            changed_by,
                             datastore: "running".to_string(),
-                            targets: vec![cell_target_path(cell_id)],
+                            targets: changed_targets,
+                            writer_origin: meta.writer_origin,
                             tx_id: meta.tx_id,
                             traceparent: meta.traceparent,
                         },
@@ -760,6 +1005,20 @@ impl DatastoreEngine {
             }
             other => Err(NetconfError::invalid_value(format!("Unsupported target: {other}"))),
         }
+    }
+
+    /// Apply a southbound E2 xApp or on-GPU dApp state sync to `running` with explicit `writer_origin`.
+    pub async fn apply_southbound_sync(
+        &self,
+        edits: &[ObjectEdit],
+        actor: &str,
+        origin: WriterOrigin,
+        meta: WriteMeta,
+    ) -> Result<(), NetconfError> {
+        let mut sync_meta = meta;
+        sync_meta.writer_origin = origin;
+        self.edit_objects_with_meta("running", edits, actor, 0, None, sync_meta)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -831,6 +1090,8 @@ impl DatastoreEngine {
                 // Extending timeout on an active persistent confirmed commit
                 if let PendingCommitState::Pending {
                     rollback_cells,
+                    rollback_du_ext,
+                    rollback_cu_objects,
                     rollback_provenance,
                     owner_user,
                     owner_session_id,
@@ -845,6 +1106,8 @@ impl DatastoreEngine {
                         owner_session_id,
                         deadline_ms,
                         rollback_cells,
+                        rollback_du_ext,
+                        rollback_cu_objects,
                         rollback_provenance,
                     };
                     let ev = append_notification(
@@ -876,6 +1139,7 @@ impl DatastoreEngine {
                             },
                             datastore: "running".to_string(),
                             targets: changed_targets,
+                            writer_origin: resolved_meta.writer_origin,
                             tx_id: resolved_meta.tx_id,
                             traceparent: resolved_meta.traceparent,
                         },
@@ -902,17 +1166,27 @@ impl DatastoreEngine {
         // Case 2: Starting a new confirmed commit (<commit><confirmed/>...</commit>)
         if confirmed {
             let prev_len = guard.persisted.notifications.len();
-            let (rollback_cells, rollback_provenance) = match &guard.persisted.pending_commit {
-                PendingCommitState::Idle => (
-                    guard.persisted.running_cells.clone(),
-                    guard.persisted.running_provenance.clone(),
-                ),
-                PendingCommitState::Pending {
-                    rollback_cells,
-                    rollback_provenance,
-                    ..
-                } => (rollback_cells.clone(), rollback_provenance.clone()),
-            };
+            let (rollback_cells, rollback_du_ext, rollback_cu_objects, rollback_provenance) =
+                match &guard.persisted.pending_commit {
+                    PendingCommitState::Idle => (
+                        guard.persisted.running_cells.clone(),
+                        guard.persisted.running_du_ext.clone(),
+                        guard.persisted.running_cu_objects.clone(),
+                        guard.persisted.running_provenance.clone(),
+                    ),
+                    PendingCommitState::Pending {
+                        rollback_cells,
+                        rollback_du_ext,
+                        rollback_cu_objects,
+                        rollback_provenance,
+                        ..
+                    } => (
+                        rollback_cells.clone(),
+                        rollback_du_ext.clone(),
+                        rollback_cu_objects.clone(),
+                        rollback_provenance.clone(),
+                    ),
+                };
             let (changed_targets, resolved_meta) =
                 promote_candidate_to_running(&mut guard, username, session_id, &meta);
             let deadline_ms = Utc::now().timestamp_millis() + (timeout_secs as i64 * 1000);
@@ -922,6 +1196,8 @@ impl DatastoreEngine {
                 owner_session_id: session_id,
                 deadline_ms,
                 rollback_cells,
+                rollback_du_ext,
+                rollback_cu_objects,
                 rollback_provenance,
             };
 
@@ -937,6 +1213,7 @@ impl DatastoreEngine {
                         },
                         datastore: "running".to_string(),
                         targets: changed_targets,
+                        writer_origin: resolved_meta.writer_origin,
                         tx_id: resolved_meta.tx_id,
                         traceparent: resolved_meta.traceparent,
                     },
@@ -983,6 +1260,7 @@ impl DatastoreEngine {
                     },
                     datastore: "running".to_string(),
                     targets: changed_targets,
+                    writer_origin: resolved_meta.writer_origin,
                     tx_id: resolved_meta.tx_id,
                     traceparent: resolved_meta.traceparent,
                 },
@@ -1014,44 +1292,60 @@ impl DatastoreEngine {
     ) -> Result<(), NetconfError> {
         let mut guard = self.inner.lock().await;
         let prev_len = guard.persisted.notifications.len();
-        let (rollback_cells, rollback_provenance, owner_user) = match &guard.persisted.pending_commit {
-            PendingCommitState::Idle => {
-                return Err(NetconfError::invalid_value("No confirmed commit is pending"));
-            }
-            PendingCommitState::Pending {
-                persist_id: active_pid,
-                owner_user,
-                owner_session_id,
-                rollback_cells,
-                rollback_provenance,
-                ..
-            } => {
-                match (&persist_id, active_pid) {
-                    (Some(req), Some(act)) if req == act => {}
-                    (None, None) if *owner_session_id == session_id => {}
-                    _ => {
-                        return Err(NetconfError::invalid_value(
-                            "cancel-commit persist-id does not match pending confirmed commit",
+        let (rollback_cells, rollback_du_ext, rollback_cu_objects, rollback_provenance, owner_user) =
+            match &guard.persisted.pending_commit {
+                PendingCommitState::Idle => {
+                    return Err(NetconfError::invalid_value("No confirmed commit is pending"));
+                }
+                PendingCommitState::Pending {
+                    persist_id: active_pid,
+                    owner_user,
+                    owner_session_id,
+                    rollback_cells,
+                    rollback_du_ext,
+                    rollback_cu_objects,
+                    rollback_provenance,
+                    ..
+                } => {
+                    match (&persist_id, active_pid) {
+                        (Some(req), Some(act)) if req == act => {}
+                        (None, None) if *owner_session_id == session_id => {}
+                        _ => {
+                            return Err(NetconfError::invalid_value(
+                                "cancel-commit persist-id does not match pending confirmed commit",
+                            ));
+                        }
+                    }
+                    if self.strict_persist_owner && owner_user != username {
+                        return Err(NetconfError::access_denied(
+                            "cancel-commit persist-id belongs to a different principal",
                         ));
                     }
+                    (
+                        rollback_cells.clone(),
+                        rollback_du_ext.clone(),
+                        rollback_cu_objects.clone(),
+                        rollback_provenance.clone(),
+                        owner_user.clone(),
+                    )
                 }
-                if self.strict_persist_owner && owner_user != username {
-                    return Err(NetconfError::access_denied(
-                        "cancel-commit persist-id belongs to a different principal",
-                    ));
-                }
-                (
-                    rollback_cells.clone(),
-                    rollback_provenance.clone(),
-                    owner_user.clone(),
-                )
-            }
-        };
+            };
 
-        let changed_targets = diff_cell_targets(&guard.persisted.running_cells, &rollback_cells);
+        let changed_leaves = diff_changed_leaves(
+            &guard.persisted.running_cells,
+            &guard.persisted.running_du_ext,
+            &guard.persisted.running_cu_objects,
+            &rollback_cells,
+            &rollback_du_ext,
+            &rollback_cu_objects,
+        );
         guard.persisted.running_cells = rollback_cells.clone();
+        guard.persisted.running_du_ext = rollback_du_ext.clone();
+        guard.persisted.running_cu_objects = rollback_cu_objects.clone();
         guard.persisted.running_provenance = rollback_provenance.clone();
         guard.candidate_cells = rollback_cells;
+        guard.candidate_du_ext = rollback_du_ext;
+        guard.candidate_cu_objects = rollback_cu_objects;
         guard.candidate_provenance = rollback_provenance;
         guard.candidate_dirty.clear();
         guard.persisted.pending_commit = PendingCommitState::Idle;
@@ -1067,7 +1361,9 @@ impl DatastoreEngine {
         );
         let _ = self.notif_tx.send(ev1);
 
-        if !changed_targets.is_empty() {
+        if !changed_leaves.is_empty() {
+            let changed_targets: Vec<String> =
+                changed_leaves.into_iter().map(|(_, p)| p).collect();
             let ev2 = append_notification(
                 &mut guard.persisted,
                 Utc::now(),
@@ -1079,6 +1375,7 @@ impl DatastoreEngine {
                     },
                     datastore: "running".to_string(),
                     targets: changed_targets,
+                    writer_origin: WriterOrigin::O1Client,
                     tx_id: None,
                     traceparent: None,
                 },
@@ -1314,22 +1611,335 @@ pub fn verify_audit_chain_file(state_path: &Path) -> Result<AuditChainReport> {
     Ok(report)
 }
 
-fn cell_target_path(cell_id: &str) -> String {
+fn leaf_target_path(kind: ManagedFunctionKind, id: &str, attr: &str) -> String {
     format!(
-        "/demo-nrcelldu:managed-element/NRCellDU[id='{cell_id}']/attributes/administrativeState"
+        "{}/{}[id='{id}']/attributes/{attr}",
+        kind.module_prefix(),
+        kind.xml_tag()
     )
 }
 
-fn diff_cell_targets(
-    before: &BTreeMap<String, String>,
-    after: &BTreeMap<String, String>,
+fn cu_object_key(kind: ManagedFunctionKind, id: &str) -> String {
+    format!("{}:{id}", kind.xml_tag())
+}
+
+fn leaf_prov_key(kind: ManagedFunctionKind, id: &str, attr: &str) -> String {
+    if kind == ManagedFunctionKind::NRCellDU && attr == "administrativeState" {
+        id.to_string()
+    } else {
+        format!("{}:{id}:{attr}", kind.xml_tag())
+    }
+}
+
+fn validate_object_edit(edit: &ObjectEdit) -> Result<(), NetconfError> {
+    if edit.id.trim().is_empty() {
+        return Err(NetconfError::invalid_value("Missing managed function id"));
+    }
+    if edit.administrative_state.is_none()
+        && edit.gpu_accelerator_profile.is_none()
+        && edit.ai_rrm_policy_id.is_none()
+    {
+        return Err(NetconfError::invalid_value(
+            "Missing administrativeState or GPU AI-RAN attributes in edit-config",
+        ));
+    }
+    if let Some(ref admin_state) = edit.administrative_state {
+        if !matches!(admin_state.as_str(), "LOCKED" | "UNLOCKED" | "SHUTTINGDOWN") {
+            return Err(NetconfError::invalid_value(format!(
+                "Invalid administrativeState: {admin_state}"
+            )));
+        }
+    }
+    if let Some(ref gpu_profile) = edit.gpu_accelerator_profile {
+        if !matches!(gpu_profile.as_str(), "NONE" | "AERIAL_CUDA" | "DOCA_DPU") {
+            return Err(NetconfError::invalid_value(format!(
+                "Invalid gpuAcceleratorProfile: {gpu_profile}"
+            )));
+        }
+    }
+    if let Some(ref policy_id) = edit.ai_rrm_policy_id {
+        if policy_id.trim().is_empty() {
+            return Err(NetconfError::invalid_value(
+                "aiRrmPolicyId must not be empty",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_edits_to_candidate(
+    guard: &mut InnerState,
+    edits: &[ObjectEdit],
+    prov: &LeafProvenance,
+) {
+    for edit in edits {
+        match edit.kind {
+            ManagedFunctionKind::NRCellDU => {
+                if let Some(ref st) = edit.administrative_state {
+                    guard.candidate_cells.insert(edit.id.clone(), st.clone());
+                    let k = leaf_prov_key(edit.kind, &edit.id, "administrativeState");
+                    guard.candidate_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_dirty.insert(k);
+                }
+                if edit.gpu_accelerator_profile.is_some() || edit.ai_rrm_policy_id.is_some() {
+                    let ext = guard
+                        .candidate_du_ext
+                        .entry(edit.id.clone())
+                        .or_default();
+                    if let Some(ref g) = edit.gpu_accelerator_profile {
+                        ext.gpu_accelerator_profile = Some(g.clone());
+                        let k = leaf_prov_key(edit.kind, &edit.id, "gpuAcceleratorProfile");
+                        guard.candidate_provenance.insert(k.clone(), prov.clone());
+                        guard.candidate_dirty.insert(k);
+                    }
+                    if let Some(ref p) = edit.ai_rrm_policy_id {
+                        ext.ai_rrm_policy_id = Some(p.clone());
+                        let k = leaf_prov_key(edit.kind, &edit.id, "aiRrmPolicyId");
+                        guard.candidate_provenance.insert(k.clone(), prov.clone());
+                        guard.candidate_dirty.insert(k);
+                    }
+                }
+            }
+            kind => {
+                let obj_key = cu_object_key(kind, &edit.id);
+                let rec = guard
+                    .candidate_cu_objects
+                    .entry(obj_key)
+                    .or_insert_with(|| CuObjectRecord {
+                        kind,
+                        id: edit.id.clone(),
+                        attrs: ManagedAttributes::default(),
+                    });
+                if let Some(ref st) = edit.administrative_state {
+                    rec.attrs.administrative_state = Some(st.clone());
+                    let k = leaf_prov_key(kind, &edit.id, "administrativeState");
+                    guard.candidate_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_dirty.insert(k);
+                }
+                if let Some(ref g) = edit.gpu_accelerator_profile {
+                    rec.attrs.gpu_accelerator_profile = Some(g.clone());
+                    let k = leaf_prov_key(kind, &edit.id, "gpuAcceleratorProfile");
+                    guard.candidate_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_dirty.insert(k);
+                }
+                if let Some(ref p) = edit.ai_rrm_policy_id {
+                    rec.attrs.ai_rrm_policy_id = Some(p.clone());
+                    let k = leaf_prov_key(kind, &edit.id, "aiRrmPolicyId");
+                    guard.candidate_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_dirty.insert(k);
+                }
+            }
+        }
+    }
+}
+
+fn apply_edits_to_running(
+    guard: &mut InnerState,
+    edits: &[ObjectEdit],
+    prov: &LeafProvenance,
 ) -> Vec<String> {
-    let mut keys: std::collections::BTreeSet<&str> = before.keys().map(|s| s.as_str()).collect();
-    keys.extend(after.keys().map(|s| s.as_str()));
-    keys.into_iter()
-        .filter(|k| before.get(*k) != after.get(*k))
-        .map(cell_target_path)
-        .collect()
+    let mut changed_targets = Vec::new();
+    for edit in edits {
+        match edit.kind {
+            ManagedFunctionKind::NRCellDU => {
+                if let Some(ref st) = edit.administrative_state {
+                    let prev = guard.persisted.running_cells.get(&edit.id).cloned();
+                    guard.persisted.running_cells.insert(edit.id.clone(), st.clone());
+                    guard.candidate_cells.insert(edit.id.clone(), st.clone());
+                    let k = leaf_prov_key(edit.kind, &edit.id, "administrativeState");
+                    guard.persisted.running_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_dirty.remove(&k);
+                    if prev.as_deref() != Some(st.as_str()) {
+                        changed_targets.push(leaf_target_path(edit.kind, &edit.id, "administrativeState"));
+                    }
+                }
+                if edit.gpu_accelerator_profile.is_some() || edit.ai_rrm_policy_id.is_some() {
+                    let run_ext = guard
+                        .persisted
+                        .running_du_ext
+                        .entry(edit.id.clone())
+                        .or_default();
+                    let cand_ext = guard
+                        .candidate_du_ext
+                        .entry(edit.id.clone())
+                        .or_default();
+                    if let Some(ref g) = edit.gpu_accelerator_profile {
+                        if run_ext.gpu_accelerator_profile.as_deref() != Some(g.as_str()) {
+                            changed_targets.push(leaf_target_path(edit.kind, &edit.id, "gpuAcceleratorProfile"));
+                        }
+                        run_ext.gpu_accelerator_profile = Some(g.clone());
+                        cand_ext.gpu_accelerator_profile = Some(g.clone());
+                        let k = leaf_prov_key(edit.kind, &edit.id, "gpuAcceleratorProfile");
+                        guard.persisted.running_provenance.insert(k.clone(), prov.clone());
+                        guard.candidate_provenance.insert(k.clone(), prov.clone());
+                        guard.candidate_dirty.remove(&k);
+                    }
+                    if let Some(ref p) = edit.ai_rrm_policy_id {
+                        if run_ext.ai_rrm_policy_id.as_deref() != Some(p.as_str()) {
+                            changed_targets.push(leaf_target_path(edit.kind, &edit.id, "aiRrmPolicyId"));
+                        }
+                        run_ext.ai_rrm_policy_id = Some(p.clone());
+                        cand_ext.ai_rrm_policy_id = Some(p.clone());
+                        let k = leaf_prov_key(edit.kind, &edit.id, "aiRrmPolicyId");
+                        guard.persisted.running_provenance.insert(k.clone(), prov.clone());
+                        guard.candidate_provenance.insert(k.clone(), prov.clone());
+                        guard.candidate_dirty.remove(&k);
+                    }
+                }
+            }
+            kind => {
+                let obj_key = cu_object_key(kind, &edit.id);
+                let run_rec = guard
+                    .persisted
+                    .running_cu_objects
+                    .entry(obj_key.clone())
+                    .or_insert_with(|| CuObjectRecord {
+                        kind,
+                        id: edit.id.clone(),
+                        attrs: ManagedAttributes::default(),
+                    });
+                let cand_rec = guard
+                    .candidate_cu_objects
+                    .entry(obj_key)
+                    .or_insert_with(|| CuObjectRecord {
+                        kind,
+                        id: edit.id.clone(),
+                        attrs: ManagedAttributes::default(),
+                    });
+                if let Some(ref st) = edit.administrative_state {
+                    if run_rec.attrs.administrative_state.as_deref() != Some(st.as_str()) {
+                        changed_targets.push(leaf_target_path(kind, &edit.id, "administrativeState"));
+                    }
+                    run_rec.attrs.administrative_state = Some(st.clone());
+                    cand_rec.attrs.administrative_state = Some(st.clone());
+                    let k = leaf_prov_key(kind, &edit.id, "administrativeState");
+                    guard.persisted.running_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_dirty.remove(&k);
+                }
+                if let Some(ref g) = edit.gpu_accelerator_profile {
+                    if run_rec.attrs.gpu_accelerator_profile.as_deref() != Some(g.as_str()) {
+                        changed_targets.push(leaf_target_path(kind, &edit.id, "gpuAcceleratorProfile"));
+                    }
+                    run_rec.attrs.gpu_accelerator_profile = Some(g.clone());
+                    cand_rec.attrs.gpu_accelerator_profile = Some(g.clone());
+                    let k = leaf_prov_key(kind, &edit.id, "gpuAcceleratorProfile");
+                    guard.persisted.running_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_dirty.remove(&k);
+                }
+                if let Some(ref p) = edit.ai_rrm_policy_id {
+                    if run_rec.attrs.ai_rrm_policy_id.as_deref() != Some(p.as_str()) {
+                        changed_targets.push(leaf_target_path(kind, &edit.id, "aiRrmPolicyId"));
+                    }
+                    run_rec.attrs.ai_rrm_policy_id = Some(p.clone());
+                    cand_rec.attrs.ai_rrm_policy_id = Some(p.clone());
+                    let k = leaf_prov_key(kind, &edit.id, "aiRrmPolicyId");
+                    guard.persisted.running_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_provenance.insert(k.clone(), prov.clone());
+                    guard.candidate_dirty.remove(&k);
+                }
+            }
+        }
+    }
+    changed_targets
+}
+
+fn collect_leaf_snapshot(
+    du_cells: &BTreeMap<String, String>,
+    du_ext: &BTreeMap<String, ManagedAttributes>,
+    cu_objects: &BTreeMap<String, CuObjectRecord>,
+) -> BTreeMap<String, (String, Option<String>)> {
+    let mut out = BTreeMap::new();
+    for (id, val) in du_cells {
+        out.insert(
+            leaf_prov_key(ManagedFunctionKind::NRCellDU, id, "administrativeState"),
+            (
+                leaf_target_path(ManagedFunctionKind::NRCellDU, id, "administrativeState"),
+                Some(val.clone()),
+            ),
+        );
+    }
+    for (id, ext) in du_ext {
+        if let Some(ref g) = ext.gpu_accelerator_profile {
+            out.insert(
+                leaf_prov_key(ManagedFunctionKind::NRCellDU, id, "gpuAcceleratorProfile"),
+                (
+                    leaf_target_path(ManagedFunctionKind::NRCellDU, id, "gpuAcceleratorProfile"),
+                    Some(g.clone()),
+                ),
+            );
+        }
+        if let Some(ref p) = ext.ai_rrm_policy_id {
+            out.insert(
+                leaf_prov_key(ManagedFunctionKind::NRCellDU, id, "aiRrmPolicyId"),
+                (
+                    leaf_target_path(ManagedFunctionKind::NRCellDU, id, "aiRrmPolicyId"),
+                    Some(p.clone()),
+                ),
+            );
+        }
+    }
+    for rec in cu_objects.values() {
+        if let Some(ref st) = rec.attrs.administrative_state {
+            out.insert(
+                leaf_prov_key(rec.kind, &rec.id, "administrativeState"),
+                (
+                    leaf_target_path(rec.kind, &rec.id, "administrativeState"),
+                    Some(st.clone()),
+                ),
+            );
+        }
+        if let Some(ref g) = rec.attrs.gpu_accelerator_profile {
+            out.insert(
+                leaf_prov_key(rec.kind, &rec.id, "gpuAcceleratorProfile"),
+                (
+                    leaf_target_path(rec.kind, &rec.id, "gpuAcceleratorProfile"),
+                    Some(g.clone()),
+                ),
+            );
+        }
+        if let Some(ref p) = rec.attrs.ai_rrm_policy_id {
+            out.insert(
+                leaf_prov_key(rec.kind, &rec.id, "aiRrmPolicyId"),
+                (
+                    leaf_target_path(rec.kind, &rec.id, "aiRrmPolicyId"),
+                    Some(p.clone()),
+                ),
+            );
+        }
+    }
+    out
+}
+
+fn diff_changed_leaves(
+    before_du: &BTreeMap<String, String>,
+    before_du_ext: &BTreeMap<String, ManagedAttributes>,
+    before_cu: &BTreeMap<String, CuObjectRecord>,
+    after_du: &BTreeMap<String, String>,
+    after_du_ext: &BTreeMap<String, ManagedAttributes>,
+    after_cu: &BTreeMap<String, CuObjectRecord>,
+) -> Vec<(String, String)> {
+    let b = collect_leaf_snapshot(before_du, before_du_ext, before_cu);
+    let a = collect_leaf_snapshot(after_du, after_du_ext, after_cu);
+    let mut keys: std::collections::BTreeSet<&str> = b.keys().map(|s| s.as_str()).collect();
+    keys.extend(a.keys().map(|s| s.as_str()));
+
+    let mut changed = Vec::new();
+    for k in keys {
+        let bv = b.get(k).and_then(|(_, v)| v.as_deref());
+        let av = a.get(k).and_then(|(_, v)| v.as_deref());
+        if bv != av {
+            let path = a
+                .get(k)
+                .or_else(|| b.get(k))
+                .map(|(p, _)| p.clone())
+                .unwrap_or_default();
+            changed.push((k.to_string(), path));
+        }
+    }
+    changed
 }
 
 fn promote_candidate_to_running(
@@ -1338,17 +1948,36 @@ fn promote_candidate_to_running(
     session_id: u64,
     commit_meta: &WriteMeta,
 ) -> (Vec<String>, WriteMeta) {
-    let changed_targets = diff_cell_targets(&guard.persisted.running_cells, &guard.candidate_cells);
+    let changed_leaves = diff_changed_leaves(
+        &guard.persisted.running_cells,
+        &guard.persisted.running_du_ext,
+        &guard.persisted.running_cu_objects,
+        &guard.candidate_cells,
+        &guard.candidate_du_ext,
+        &guard.candidate_cu_objects,
+    );
     let now = Utc::now();
     let mut resolved_tx = commit_meta.tx_id.clone();
     let mut resolved_tp = commit_meta.traceparent.clone();
+    let mut resolved_origin = commit_meta.writer_origin;
 
-    let candidate_snapshot = guard.candidate_cells.clone();
-    for (cell_id, val) in &candidate_snapshot {
-        let value_changed = guard.persisted.running_cells.get(cell_id) != Some(val);
-        let dirty = guard.candidate_dirty.contains(cell_id);
+    let before_snap = collect_leaf_snapshot(
+        &guard.persisted.running_cells,
+        &guard.persisted.running_du_ext,
+        &guard.persisted.running_cu_objects,
+    );
+    let after_snap = collect_leaf_snapshot(
+        &guard.candidate_cells,
+        &guard.candidate_du_ext,
+        &guard.candidate_cu_objects,
+    );
+
+    for (leaf_key, (_, new_val)) in &after_snap {
+        let old_val = before_snap.get(leaf_key).and_then(|(_, v)| v.as_ref());
+        let value_changed = old_val != new_val.as_ref();
+        let dirty = guard.candidate_dirty.contains(leaf_key);
         if value_changed || dirty {
-            let cand_prov = guard.candidate_provenance.get(cell_id);
+            let cand_prov = guard.candidate_provenance.get(leaf_key);
             let tx_id = commit_meta
                 .tx_id
                 .clone()
@@ -1357,15 +1986,24 @@ fn promote_candidate_to_running(
                 .traceparent
                 .clone()
                 .or_else(|| cand_prov.and_then(|p| p.traceparent.clone()));
+            let origin = if commit_meta.writer_origin != WriterOrigin::O1Client {
+                commit_meta.writer_origin
+            } else {
+                cand_prov.map(|p| p.writer_origin).unwrap_or(WriterOrigin::O1Client)
+            };
             if resolved_tx.is_none() {
                 resolved_tx = tx_id.clone();
             }
             if resolved_tp.is_none() {
                 resolved_tp = traceparent.clone();
             }
+            if resolved_origin == WriterOrigin::O1Client && origin != WriterOrigin::O1Client {
+                resolved_origin = origin;
+            }
             let prov = LeafProvenance {
                 owner_principal: username.to_string(),
                 owner_session_id: session_id,
+                writer_origin: origin,
                 tx_id,
                 traceparent,
                 updated_at: now,
@@ -1373,58 +2011,145 @@ fn promote_candidate_to_running(
             guard
                 .persisted
                 .running_provenance
-                .insert(cell_id.clone(), prov.clone());
-            guard.candidate_provenance.insert(cell_id.clone(), prov);
+                .insert(leaf_key.clone(), prov.clone());
+            guard.candidate_provenance.insert(leaf_key.clone(), prov);
         }
     }
 
-    guard.persisted.running_cells = candidate_snapshot;
+    guard.persisted.running_cells = guard.candidate_cells.clone();
+    guard.persisted.running_du_ext = guard.candidate_du_ext.clone();
+    guard.persisted.running_cu_objects = guard.candidate_cu_objects.clone();
     guard.candidate_dirty.clear();
+    let changed_targets: Vec<String> = changed_leaves.into_iter().map(|(_, p)| p).collect();
     (
         changed_targets,
         WriteMeta {
             tx_id: resolved_tx,
             traceparent: resolved_tp,
+            writer_origin: resolved_origin,
         },
     )
 }
 
 pub fn render_cells_xml(cells: &BTreeMap<String, String>) -> String {
-    render_cells_xml_with_provenance(cells, None)
+    render_datastore_xml_with_provenance(cells, &BTreeMap::new(), &BTreeMap::new(), None)
 }
 
-pub fn render_cells_xml_with_provenance(
-    cells: &BTreeMap<String, String>,
+fn format_prov_attrs(
+    provenance: Option<&BTreeMap<String, LeafProvenance>>,
+    leaf_key: &str,
+) -> String {
+    provenance
+        .and_then(|map| map.get(leaf_key))
+        .map(|p| {
+            let mut attrs = format!(
+                " xmlns:o1p=\"{PROVENANCE_NS}\" o1p:owner=\"{}\" o1p:session-id=\"{}\" o1p:writer-origin=\"{}\" o1p:updated-at=\"{}\"",
+                xml_escape(&p.owner_principal),
+                p.owner_session_id,
+                p.writer_origin.as_str(),
+                p.updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            );
+            if let Some(ref tx) = p.tx_id {
+                attrs.push_str(&format!(" o1p:tx-id=\"{}\"", xml_escape(tx)));
+            }
+            if let Some(ref tp) = p.traceparent {
+                attrs.push_str(&format!(" o1p:traceparent=\"{}\"", xml_escape(tp)));
+            }
+            attrs
+        })
+        .unwrap_or_default()
+}
+
+pub fn render_datastore_xml_with_provenance(
+    du_cells: &BTreeMap<String, String>,
+    du_ext: &BTreeMap<String, ManagedAttributes>,
+    cu_objects: &BTreeMap<String, CuObjectRecord>,
     provenance: Option<&BTreeMap<String, LeafProvenance>>,
 ) -> String {
-    let mut inner = String::new();
-    for (id, state) in cells {
-        let prov_attrs = provenance
-            .and_then(|map| map.get(id))
-            .map(|p| {
-                let mut attrs = format!(
-                    " xmlns:o1p=\"{PROVENANCE_NS}\" o1p:owner=\"{}\" o1p:session-id=\"{}\" o1p:updated-at=\"{}\"",
-                    xml_escape(&p.owner_principal),
-                    p.owner_session_id,
-                    p.updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    let mut du_inner = String::new();
+    for (id, state) in du_cells {
+        let admin_attrs = format_prov_attrs(
+            provenance,
+            &leaf_prov_key(ManagedFunctionKind::NRCellDU, id, "administrativeState"),
+        );
+        let mut extra_tags = String::new();
+        if let Some(ext) = du_ext.get(id) {
+            if let Some(ref gpu) = ext.gpu_accelerator_profile {
+                let gpu_attrs = format_prov_attrs(
+                    provenance,
+                    &leaf_prov_key(ManagedFunctionKind::NRCellDU, id, "gpuAcceleratorProfile"),
                 );
-                if let Some(ref tx) = p.tx_id {
-                    attrs.push_str(&format!(" o1p:tx-id=\"{}\"", xml_escape(tx)));
-                }
-                if let Some(ref tp) = p.traceparent {
-                    attrs.push_str(&format!(" o1p:traceparent=\"{}\"", xml_escape(tp)));
-                }
-                attrs
-            })
-            .unwrap_or_default();
-
-        inner.push_str(&format!(
-            "<NRCellDU><id>{}</id><attributes><administrativeState{prov_attrs}>{}</administrativeState></attributes></NRCellDU>",
+                extra_tags.push_str(&format!(
+                    "<gpuAcceleratorProfile{gpu_attrs}>{}</gpuAcceleratorProfile>",
+                    xml_escape(gpu)
+                ));
+            }
+            if let Some(ref pol) = ext.ai_rrm_policy_id {
+                let pol_attrs = format_prov_attrs(
+                    provenance,
+                    &leaf_prov_key(ManagedFunctionKind::NRCellDU, id, "aiRrmPolicyId"),
+                );
+                extra_tags.push_str(&format!(
+                    "<aiRrmPolicyId{pol_attrs}>{}</aiRrmPolicyId>",
+                    xml_escape(pol)
+                ));
+            }
+        }
+        du_inner.push_str(&format!(
+            "<NRCellDU><id>{}</id><attributes><administrativeState{admin_attrs}>{}</administrativeState>{extra_tags}</attributes></NRCellDU>",
             xml_escape(id),
             xml_escape(state)
         ));
     }
-    format!("<managed-element xmlns=\"{DEMO_NS}\">{inner}</managed-element>")
+
+    let mut xml = format!("<managed-element xmlns=\"{DEMO_NS}\">{du_inner}</managed-element>");
+
+    if !cu_objects.is_empty() {
+        let mut cu_inner = String::new();
+        for rec in cu_objects.values() {
+            let tag = rec.kind.xml_tag();
+            let mut attrs_xml = String::new();
+            if let Some(ref st) = rec.attrs.administrative_state {
+                let a = format_prov_attrs(
+                    provenance,
+                    &leaf_prov_key(rec.kind, &rec.id, "administrativeState"),
+                );
+                attrs_xml.push_str(&format!(
+                    "<administrativeState{a}>{}</administrativeState>",
+                    xml_escape(st)
+                ));
+            }
+            if let Some(ref gpu) = rec.attrs.gpu_accelerator_profile {
+                let a = format_prov_attrs(
+                    provenance,
+                    &leaf_prov_key(rec.kind, &rec.id, "gpuAcceleratorProfile"),
+                );
+                attrs_xml.push_str(&format!(
+                    "<gpuAcceleratorProfile{a}>{}</gpuAcceleratorProfile>",
+                    xml_escape(gpu)
+                ));
+            }
+            if let Some(ref pol) = rec.attrs.ai_rrm_policy_id {
+                let a = format_prov_attrs(
+                    provenance,
+                    &leaf_prov_key(rec.kind, &rec.id, "aiRrmPolicyId"),
+                );
+                attrs_xml.push_str(&format!(
+                    "<aiRrmPolicyId{a}>{}</aiRrmPolicyId>",
+                    xml_escape(pol)
+                ));
+            }
+            cu_inner.push_str(&format!(
+                "<{tag}><id>{}</id><attributes>{attrs_xml}</attributes></{tag}>",
+                xml_escape(&rec.id)
+            ));
+        }
+        xml.push_str(&format!(
+            "<ManagedElement xmlns=\"{OCU_NRM_NS}\">{cu_inner}</ManagedElement>"
+        ));
+    }
+
+    xml
 }
 
 fn atomic_write_json<T: Serialize>(target: &Path, value: &T) -> Result<()> {
@@ -1696,6 +2421,7 @@ mod tests {
             WriteMeta {
                 tx_id: Some("tx-edit-100".into()),
                 traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+                ..Default::default()
             },
         )
         .await
@@ -1799,5 +2525,193 @@ mod tests {
         let tampered_live = eng_reopened.verify_audit_chain().await;
         assert!(!tampered_live.valid);
         assert_eq!(tampered_live.tampered_seq, Some(2));
+    }
+
+    #[tokio::test]
+    async fn ocu_gpu_airan_per_leaf_provenance_southbound_and_pod_restart_rollback() {
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("ocu_state.json");
+        let eng = DatastoreEngine::open(&state_file, true).unwrap();
+        let sid_smo = eng.allocate_session_id().await.unwrap();
+
+        // 1. Default running XML has only NRCellDU for 100% o1demo.py compatibility
+        let initial_xml = eng.get_config_xml("running").await.unwrap();
+        assert!(!initial_xml.contains("NRCellCU"));
+
+        // 2. O1 client confirms GNBCUCPFunction, GNBCUUPFunction, NRCellCU + NRCellDU
+        eng.edit_objects_with_meta(
+            "candidate",
+            &[
+                ObjectEdit {
+                    kind: ManagedFunctionKind::GNBCUCPFunction,
+                    id: "cucp-1".into(),
+                    administrative_state: Some("UNLOCKED".into()),
+                    gpu_accelerator_profile: Some("NONE".into()),
+                    ai_rrm_policy_id: Some("rrm-base-v1".into()),
+                },
+                ObjectEdit {
+                    kind: ManagedFunctionKind::GNBCUUPFunction,
+                    id: "cuup-1".into(),
+                    administrative_state: Some("UNLOCKED".into()),
+                    gpu_accelerator_profile: Some("DOCA_DPU".into()),
+                    ai_rrm_policy_id: None,
+                },
+                ObjectEdit {
+                    kind: ManagedFunctionKind::NRCellCU,
+                    id: "cu-cell-1".into(),
+                    administrative_state: Some("UNLOCKED".into()),
+                    gpu_accelerator_profile: Some("AERIAL_CUDA".into()),
+                    ai_rrm_policy_id: Some("rrm-energy-v1".into()),
+                },
+                ObjectEdit {
+                    kind: ManagedFunctionKind::NRCellDU,
+                    id: "cell-1".into(),
+                    administrative_state: Some("UNLOCKED".into()),
+                    gpu_accelerator_profile: Some("AERIAL_CUDA".into()),
+                    ai_rrm_policy_id: None,
+                },
+            ],
+            "smo",
+            sid_smo,
+            None,
+            WriteMeta {
+                tx_id: Some("tx-cu-init".into()),
+                traceparent: Some("00-33333333333333333333333333333333-4444444444444444-01".into()),
+                writer_origin: WriterOrigin::O1Client,
+            },
+        )
+        .await
+        .unwrap();
+        eng.commit(false, 300, None, None, "smo", sid_smo, None)
+            .await
+            .unwrap();
+
+        let xml_prov = eng
+            .get_config_xml_with_provenance("running", true)
+            .await
+            .unwrap();
+        assert!(xml_prov.contains("<GNBCUCPFunction><id>cucp-1</id>"));
+        assert!(xml_prov.contains("<GNBCUUPFunction><id>cuup-1</id>"));
+        assert!(xml_prov.contains("DOCA_DPU"));
+        assert!(xml_prov.contains("AERIAL_CUDA"));
+        assert!(xml_prov.contains("o1p:writer-origin=\"o1-client\""));
+
+        // 3. Southbound GPU dApp updates ONLY aiRrmPolicyId on NRCellCU while E2 xApp updates SHUTTINGDOWN
+        eng.apply_southbound_sync(
+            &[ObjectEdit {
+                kind: ManagedFunctionKind::NRCellCU,
+                id: "cu-cell-1".into(),
+                administrative_state: None,
+                gpu_accelerator_profile: None,
+                ai_rrm_policy_id: Some("rrm-slot-gpu-v9".into()),
+            }],
+            "aerial-dapp",
+            WriterOrigin::GpuDapp,
+            WriteMeta {
+                tx_id: Some("tx-gpu-dapp-9".into()),
+                traceparent: None,
+                writer_origin: WriterOrigin::GpuDapp,
+            },
+        )
+        .await
+        .unwrap();
+
+        eng.apply_southbound_sync(
+            &[ObjectEdit {
+                kind: ManagedFunctionKind::NRCellCU,
+                id: "cu-cell-1".into(),
+                administrative_state: Some("SHUTTINGDOWN".into()),
+                gpu_accelerator_profile: None,
+                ai_rrm_policy_id: None,
+            }],
+            "ric-xapp-es",
+            WriterOrigin::E2Xapp,
+            WriteMeta::default(),
+        )
+        .await
+        .unwrap();
+
+        let mixed_prov = eng
+            .get_config_xml_with_provenance("running", true)
+            .await
+            .unwrap();
+        assert!(mixed_prov.contains("o1p:owner=\"aerial-dapp\""));
+        assert!(mixed_prov.contains("o1p:writer-origin=\"gpu-dapp\""));
+        assert!(mixed_prov.contains("o1p:owner=\"ric-xapp-es\""));
+        assert!(mixed_prov.contains("o1p:writer-origin=\"e2-xapp\""));
+        // gpuAcceleratorProfile on NRCellCU still retains smo's o1-client ownership
+        assert!(mixed_prov.contains("o1p:owner=\"smo\""));
+
+        // 4. Concurrent O-CU + O-DU confirmed commit followed by pod crash/restart (T3a/T3c)
+        eng.edit_objects_with_meta(
+            "candidate",
+            &[
+                ObjectEdit {
+                    kind: ManagedFunctionKind::NRCellCU,
+                    id: "cu-cell-1".into(),
+                    administrative_state: Some("LOCKED".into()),
+                    gpu_accelerator_profile: None,
+                    ai_rrm_policy_id: None,
+                },
+                ObjectEdit {
+                    kind: ManagedFunctionKind::NRCellDU,
+                    id: "cell-1".into(),
+                    administrative_state: Some("LOCKED".into()),
+                    gpu_accelerator_profile: None,
+                    ai_rrm_policy_id: None,
+                },
+            ],
+            "smo",
+            sid_smo,
+            None,
+            WriteMeta::default(),
+        )
+        .await
+        .unwrap();
+        eng.commit(
+            true,
+            300,
+            Some("pod-crash-tok".into()),
+            None,
+            "smo",
+            sid_smo,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(eng
+            .get_config_xml("running")
+            .await
+            .unwrap()
+            .contains("<administrativeState>LOCKED</administrativeState>"));
+
+        drop(eng);
+
+        // Pod restart rolls back BOTH NRCellCU (to SHUTTINGDOWN) and NRCellDU (to UNLOCKED)
+        let eng2 = DatastoreEngine::open(&state_file, true).unwrap();
+        let sid2 = eng2.allocate_session_id().await.unwrap();
+        let after_restart = eng2
+            .get_config_xml_with_provenance("running", true)
+            .await
+            .unwrap();
+        assert!(after_restart.contains("<NRCellCU><id>cu-cell-1</id>"));
+        assert!(after_restart.contains("SHUTTINGDOWN"));
+        assert!(after_restart.contains("UNLOCKED"));
+
+        // Stale persist-id rejected with invalid-value (T3a/T3c)
+        let err = eng2
+            .commit(false, 300, None, Some("pod-crash-tok".into()), "smo", sid2, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_tag, "invalid-value");
+
+        // Replay shows <changed-by><server/></changed-by> + <writer-origin>server-rollback</writer-origin>
+        let (events, _) = eng2
+            .replay_and_subscribe(Some(DateTime::from_timestamp(0, 0).unwrap()))
+            .await;
+        let last_xml = events.last().unwrap().to_notification_xml();
+        assert!(last_xml.contains("<changed-by><server/></changed-by>"));
+        assert!(last_xml.contains("<writer-origin>server-rollback</writer-origin>"));
+        assert!(eng2.verify_audit_chain().await.valid);
     }
 }

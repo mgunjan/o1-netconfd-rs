@@ -508,4 +508,176 @@ mod tests {
         let _ = sess_smo2.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
         srv_task.abort();
     }
+
+    #[tokio::test]
+    async fn ssh_wire_concurrent_ocu_odu_confirmed_commits_gpu_profile_and_restart_rollback() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("ocu_wire_state.json");
+        let mut users = HashMap::new();
+        users.insert("smo".to_string(), "smopass".to_string());
+        users.insert("ops2".to_string(), "ops2pass".to_string());
+        let users_arc = Arc::new(users);
+
+        let spawn_server = |eng: DatastoreEngine, users: Arc<HashMap<String, String>>| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = Arc::new(build_server_config().unwrap());
+            let mut srv = NetconfSshServer {
+                engine: eng,
+                users,
+            };
+            let task = tokio::spawn(async move {
+                let _ = srv.run_on_socket(config, &listener).await;
+            });
+            (addr, task)
+        };
+
+        let connect_client = |addr: SocketAddr, user: &'static str, pass: &'static str| async move {
+            let mut session = timeout(
+                Duration::from_secs(5),
+                russh::client::connect(Arc::new(russh::client::Config::default()), addr, TestClient),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(session.authenticate_password(user, pass).await.unwrap());
+            let mut channel = session.channel_open_session().await.unwrap();
+            channel.request_subsystem(true, "netconf").await.unwrap();
+            let mut rx_buf = Vec::new();
+            let hello = read_netconf_frame(&mut channel, &mut rx_buf, FramingMode::Base10).await;
+            assert!(hello.contains("urn:3gpp:sa5:_3gpp-nr-nrm-nrcellcu"));
+            let client_hello = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <hello xmlns=\"{NETCONF_BASE_NS}\">\
+                   <capabilities>\
+                     <capability>urn:ietf:params:netconf:base:1.0</capability>\
+                     <capability>urn:ietf:params:netconf:base:1.1</capability>\
+                   </capabilities>\
+                 </hello>"
+            );
+            channel
+                .data(&encode_frame(&client_hello, FramingMode::Base10)[..])
+                .await
+                .unwrap();
+            (session, channel, rx_buf)
+        };
+
+        // Phase 1: Boot server, commit GPU O-CU + O-DU baseline, then start confirmed commit & simulate pod crash
+        let eng1 = DatastoreEngine::open(&state_path, true).unwrap();
+        let (addr1, srv_task1) = spawn_server(eng1, users_arc.clone()).await;
+
+        let (sess_smo, mut ch_smo, mut rx_smo) = connect_client(addr1, "smo", "smopass").await;
+        let baseline_rpc = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"1\" tx-id=\"tx-cu-base\">\
+               <edit-config><target><running/></target><config>\
+                 <ManagedElement xmlns=\"urn:3gpp:sa5:_3gpp-nr-nrm-nrcellcu\">\
+                   <GNBCUCPFunction><id>cucp-1</id><attributes><administrativeState>UNLOCKED</administrativeState></attributes></GNBCUCPFunction>\
+                   <GNBCUUPFunction><id>cuup-1</id><attributes><gpuAcceleratorProfile>DOCA_DPU</gpuAcceleratorProfile></attributes></GNBCUUPFunction>\
+                   <NRCellCU><id>cu-cell-1</id><attributes><administrativeState>UNLOCKED</administrativeState><gpuAcceleratorProfile>AERIAL_CUDA</gpuAcceleratorProfile><aiRrmPolicyId>rrm-base</aiRrmPolicyId></attributes></NRCellCU>\
+                 </ManagedElement>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        assert!(send_rpc(&mut ch_smo, &mut rx_smo, &baseline_rpc).await.contains("<ok/>"));
+
+        // ops2 updates NRCellDU while smo starts a confirmed commit across NRCellCU + NRCellDU
+        let (sess_ops2, mut ch_ops2, mut rx_ops2) = connect_client(addr1, "ops2", "ops2pass").await;
+        let ops2_du_rpc = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"2\" tx-id=\"tx-du-ops2\">\
+               <edit-config><target><running/></target><config>\
+                 <managed-element xmlns=\"urn:demo:o1:nrcelldu\">\
+                   <NRCellDU><id>cell-1</id><attributes><administrativeState>UNLOCKED</administrativeState></attributes></NRCellDU>\
+                 </managed-element>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        assert!(send_rpc(&mut ch_ops2, &mut rx_ops2, &ops2_du_rpc).await.contains("<ok/>"));
+
+        // smo issues confirmed commit changing both NRCellCU -> LOCKED and NRCellDU -> LOCKED
+        let cand_rpc = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"3\" tx-id=\"tx-pod-crash\">\
+               <edit-config><target><candidate/></target><config>\
+                 <managed-element xmlns=\"urn:demo:o1:nrcelldu\">\
+                   <NRCellDU><id>cell-1</id><attributes><administrativeState>LOCKED</administrativeState></attributes></NRCellDU>\
+                 </managed-element>\
+                 <ManagedElement xmlns=\"urn:3gpp:sa5:_3gpp-nr-nrm-nrcellcu\">\
+                   <NRCellCU><id>cu-cell-1</id><attributes><administrativeState>LOCKED</administrativeState></attributes></NRCellCU>\
+                 </ManagedElement>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        assert!(send_rpc(&mut ch_smo, &mut rx_smo, &cand_rpc).await.contains("<ok/>"));
+        let confirmed_rpc = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"4\">\
+               <commit><confirmed/><confirm-timeout>300</confirm-timeout><persist>ocu-pod-tok</persist></commit>\
+             </rpc>"
+        );
+        assert!(send_rpc(&mut ch_smo, &mut rx_smo, &confirmed_rpc).await.contains("<ok/>"));
+
+        let _ = sess_smo.disconnect(russh::Disconnect::ByApplication, "crash", "en").await;
+        let _ = sess_ops2.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+        drop(ch_smo);
+        drop(ch_ops2);
+        drop(sess_smo);
+        drop(sess_ops2);
+        srv_task1.abort();
+        let _ = srv_task1.await;
+
+        // Phase 2: Pod restart on same state_path -> rolls back both NRCellCU & NRCellDU, rejects stale token
+        let mut eng2_opt = None;
+        for _ in 0..40 {
+            if let Ok(e) = DatastoreEngine::open(&state_path, true) {
+                eng2_opt = Some(e);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let eng2 = eng2_opt.expect("reopened DatastoreEngine after server shutdown");
+        let (addr2, srv_task2) = spawn_server(eng2, users_arc).await;
+        let (sess_check, mut ch_check, mut rx_check) = connect_client(addr2, "smo", "smopass").await;
+
+        let stale_confirm = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"5\"><commit><persist-id>ocu-pod-tok</persist-id></commit></rpc>"
+        );
+        let stale_reply = send_rpc(&mut ch_check, &mut rx_check, &stale_confirm).await;
+        assert!(stale_reply.contains("<error-tag>invalid-value</error-tag>"));
+
+        let get_prov = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"6\">\
+               <get-config><source><running/></source><with-provenance/></get-config>\
+             </rpc>"
+        );
+        let prov_reply = send_rpc(&mut ch_check, &mut rx_check, &get_prov).await;
+        assert!(prov_reply.contains("o1p:owner=\"ops2\""));
+        assert!(prov_reply.contains("o1p:tx-id=\"tx-du-ops2\""));
+        assert!(prov_reply.contains("o1p:owner=\"smo\""));
+        assert!(prov_reply.contains("AERIAL_CUDA"));
+        assert!(prov_reply.contains("DOCA_DPU"));
+
+        // Verify replay contains <changed-by><server/></changed-by> + server-rollback
+        let sub_rpc = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"7\">\
+               <create-subscription xmlns=\"urn:ietf:params:xml:ns:netconf:notification:1.0\">\
+                 <stream>NETCONF</stream><startTime>1970-01-01T00:00:00Z</startTime>\
+               </create-subscription>\
+             </rpc>"
+        );
+        assert!(send_rpc(&mut ch_check, &mut rx_check, &sub_rpc).await.contains("<ok/>"));
+        let mut saw_server_rollback = false;
+        loop {
+            let msg = read_netconf_frame(&mut ch_check, &mut rx_check, FramingMode::Base11).await;
+            if msg.contains("<replayComplete") {
+                break;
+            }
+            if msg.contains("<changed-by><server/></changed-by>")
+                && msg.contains("<writer-origin>server-rollback</writer-origin>")
+            {
+                saw_server_rollback = true;
+            }
+        }
+        assert!(saw_server_rollback);
+
+        let _ = sess_check.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+        srv_task2.abort();
+    }
 }
