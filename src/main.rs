@@ -5,6 +5,7 @@ pub mod fault_proxy;
 pub mod framing;
 pub mod rpc;
 pub mod ssh;
+pub mod ves;
 
 use anyhow::Result;
 use clap::Parser;
@@ -39,6 +40,10 @@ struct Cli {
     /// Verify tamper-evident SHA-256 hash-chained WAL integrity and exit
     #[arg(long, default_value_t = false)]
     verify_audit_chain: bool,
+
+    /// Optional 3GPP TS 28.532 notifyMOIChanges VES 7.x HTTP endpoint URL (e.g. http://127.0.0.1:30417/eventListener/v7)
+    #[arg(long)]
+    ves_endpoint: Option<String>,
 }
 
 #[tokio::main]
@@ -81,6 +86,10 @@ async fn main() -> Result<()> {
 
     let engine = DatastoreEngine::open(&cli.state_file, cli.strict_persist_owner)?;
     engine.spawn_timeout_watcher();
+    if let Some(ref ves_url) = cli.ves_endpoint {
+        engine.spawn_ves_emitter(ves_url)?;
+        tracing::info!(endpoint = %ves_url, "VES notifyMOIChanges emitter enabled");
+    }
 
     tracing::info!(listen = %cli.listen, state = %cli.state_file.display(), "Starting o1-netconfd-rs");
     ssh::run_ssh_server(&cli.listen, engine, user_map).await

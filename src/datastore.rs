@@ -273,6 +273,7 @@ pub struct DatastoreEngine {
     inner: Arc<Mutex<InnerState>>,
     wal_db: Arc<std::sync::Mutex<Database>>,
     notif_tx: broadcast::Sender<NotificationRecord>,
+    startup_events: Arc<Vec<NotificationRecord>>,
 }
 
 impl DatastoreEngine {
@@ -373,6 +374,7 @@ impl DatastoreEngine {
             write_txn.commit()?;
         }
 
+        let startup_events = Arc::new(persisted.notifications[pre_recovery_len..].to_vec());
         let candidate_cells = persisted.running_cells.clone();
         let candidate_provenance = persisted.running_provenance.clone();
         let (notif_tx, _) = broadcast::channel(256);
@@ -389,9 +391,40 @@ impl DatastoreEngine {
             })),
             wal_db: Arc::new(std::sync::Mutex::new(wal_db)),
             notif_tx,
+            startup_events,
         };
 
         Ok(engine)
+    }
+
+    /// Spawn a background async VES 7.x `notifyMOIChanges` HTTP JSON emitter for every
+    /// committed `running` change (including startup crash-recovery rollbacks).
+    pub fn spawn_ves_emitter(&self, endpoint_url: &str) -> Result<tokio::task::JoinHandle<()>> {
+        let endpoint = crate::ves::VesEndpoint::parse(endpoint_url)?;
+        let mut rx = self.notif_tx.subscribe();
+        let startup = self.startup_events.clone();
+        Ok(tokio::spawn(async move {
+            for ev in startup.iter() {
+                if let Err(err) = crate::ves::emit_record_if_config_change(&endpoint, ev).await {
+                    tracing::warn!(error = %err, "Failed to emit startup VES notifyMOIChanges");
+                }
+            }
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if let Err(err) =
+                            crate::ves::emit_record_if_config_change(&endpoint, &ev).await
+                        {
+                            tracing::warn!(error = %err, "Failed to emit VES notifyMOIChanges");
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "VES emitter lagged behind broadcast stream");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }))
     }
 
     fn persist_with_wal(&self, persisted: &PersistedStore, prev_len: usize) -> Result<()> {
