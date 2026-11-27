@@ -1,8 +1,8 @@
 //! RFC 6241 + RFC 5277 XML RPC parser and dispatcher using `quick-xml`.
 
 use crate::datastore::{
-    xml_escape, DatastoreEngine, NetconfError, NotificationRecord, WriteMeta, NOTIF_WRAP_NS,
-    REPLAY_MOD_NS,
+    xml_escape, DatastoreEngine, ManagedFunctionKind, NetconfError, NotificationRecord, ObjectEdit,
+    WriteMeta, WriterOrigin, NOTIF_WRAP_NS, REPLAY_MOD_NS,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use quick_xml::events::Event;
@@ -33,6 +33,7 @@ pub fn build_server_hello(session_id: u64) -> String {
              <capability>urn:ietf:params:netconf:capability:interleave:1.0</capability>\
              <capability>urn:ietf:params:xml:ns:yang:ietf-netconf-notifications?module=ietf-netconf-notifications&amp;revision=2012-02-06</capability>\
              <capability>urn:demo:o1:nrcelldu?module=demo-nrcelldu&amp;revision=2026-11-25</capability>\
+             <capability>urn:3gpp:sa5:_3gpp-nr-nrm-nrcellcu?module=_3gpp-nr-nrm-nrcellcu&amp;revision=2026-11-27</capability>\
            </capabilities>\
            <session-id>{session_id}</session-id>\
          </hello>"
@@ -140,22 +141,31 @@ pub async fn handle_rpc(
         }
         Some("edit-config") => {
             let target = parsed.target.as_deref().unwrap_or("candidate");
-            let cell_id = parsed.cell_id.as_deref().unwrap_or("cell-1");
-            let Some(admin_state) = parsed.admin_state.as_deref() else {
+            if let Some(ref bad_origin) = parsed.invalid_writer_origin {
+                return RpcOutcome {
+                    reply_xml: wrap_err(NetconfError::invalid_value(format!(
+                        "Unsupported writer-origin: {bad_origin}"
+                    ))),
+                    close_after: false,
+                    subscription: None,
+                };
+            }
+            if parsed.edits.is_empty() {
                 return RpcOutcome {
                     reply_xml: wrap_err(NetconfError::invalid_value(
-                        "Missing administrativeState in edit-config",
+                        "Missing administrativeState or managed object in edit-config",
                     )),
                     close_after: false,
                     subscription: None,
                 };
-            };
+            }
             let meta = WriteMeta {
                 tx_id: parsed.tx_id.clone(),
                 traceparent: parsed.traceparent.clone(),
+                writer_origin: parsed.writer_origin.unwrap_or(WriterOrigin::O1Client),
             };
             let reply_xml = match engine
-                .edit_config_with_meta(target, cell_id, admin_state, username, session_id, source_host, meta)
+                .edit_objects_with_meta(target, &parsed.edits, username, session_id, source_host, meta)
                 .await
             {
                 Ok(()) => wrap_ok(),
@@ -176,6 +186,7 @@ pub async fn handle_rpc(
             let meta = WriteMeta {
                 tx_id: parsed.tx_id.clone(),
                 traceparent: parsed.traceparent.clone(),
+                writer_origin: parsed.writer_origin.unwrap_or(WriterOrigin::O1Client),
             };
             let reply_xml = match engine
                 .commit_with_meta(
@@ -272,8 +283,7 @@ struct ParsedRpc {
     op: Option<String>,
     source: Option<String>,
     target: Option<String>,
-    cell_id: Option<String>,
-    admin_state: Option<String>,
+    edits: Vec<ObjectEdit>,
     confirmed: bool,
     confirm_timeout: Option<String>,
     persist: Option<String>,
@@ -281,7 +291,54 @@ struct ParsedRpc {
     start_time: Option<String>,
     tx_id: Option<String>,
     traceparent: Option<String>,
+    writer_origin: Option<WriterOrigin>,
+    invalid_writer_origin: Option<String>,
     with_provenance: bool,
+}
+
+#[derive(Debug)]
+struct PendingObjectEdit {
+    kind: ManagedFunctionKind,
+    id: Option<String>,
+    administrative_state: Option<String>,
+    gpu_accelerator_profile: Option<String>,
+    ai_rrm_policy_id: Option<String>,
+}
+
+impl PendingObjectEdit {
+    fn new(kind: ManagedFunctionKind) -> Self {
+        Self {
+            kind,
+            id: None,
+            administrative_state: None,
+            gpu_accelerator_profile: None,
+            ai_rrm_policy_id: None,
+        }
+    }
+
+    fn into_object_edit(self) -> ObjectEdit {
+        let default_id = match self.kind {
+            ManagedFunctionKind::NRCellDU => "cell-1".to_string(),
+            _ => String::new(),
+        };
+        ObjectEdit {
+            kind: self.kind,
+            id: self.id.unwrap_or(default_id),
+            administrative_state: self.administrative_state,
+            gpu_accelerator_profile: self.gpu_accelerator_profile,
+            ai_rrm_policy_id: self.ai_rrm_policy_id,
+        }
+    }
+}
+
+fn parse_managed_kind(name: &str) -> Option<ManagedFunctionKind> {
+    match name {
+        "NRCellDU" => Some(ManagedFunctionKind::NRCellDU),
+        "NRCellCU" => Some(ManagedFunctionKind::NRCellCU),
+        "GNBCUCPFunction" => Some(ManagedFunctionKind::GNBCUCPFunction),
+        "GNBCUUPFunction" => Some(ManagedFunctionKind::GNBCUUPFunction),
+        _ => None,
+    }
 }
 
 fn local_name(raw: &[u8]) -> String {
@@ -297,6 +354,13 @@ fn extract_meta_attrs(e: &quick_xml::events::BytesStart<'_>, out: &mut ParsedRpc
             "message-id" if local_name(e.name().as_ref()) == "rpc" => out.message_id = Some(val),
             "tx-id" | "txid" | "etag" => out.tx_id = Some(val),
             "traceparent" => out.traceparent = Some(val),
+            "writer-origin" => {
+                if let Some(wo) = WriterOrigin::parse_str(&val) {
+                    out.writer_origin = Some(wo);
+                } else {
+                    out.invalid_writer_origin = Some(val);
+                }
+            }
             "with-provenance" | "with-metadata" if val == "true" || val == "1" => {
                 out.with_provenance = true;
             }
@@ -311,6 +375,8 @@ fn parse_rpc(xml: &str) -> ParsedRpc {
     reader.config_mut().trim_text(true);
 
     let mut stack: Vec<String> = Vec::new();
+    let mut current_edit: Option<PendingObjectEdit> = None;
+
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
@@ -326,6 +392,8 @@ fn parse_rpc(xml: &str) -> ParsedRpc {
                     out.target = Some(name.clone());
                 } else if name == "confirmed" {
                     out.confirmed = true;
+                } else if let Some(kind) = parse_managed_kind(&name) {
+                    current_edit = Some(PendingObjectEdit::new(kind));
                 }
                 stack.push(name);
             }
@@ -350,18 +418,49 @@ fn parse_rpc(xml: &str) -> ParsedRpc {
                     continue;
                 }
                 match stack.last().map(|s| s.as_str()) {
-                    Some("id") => out.cell_id = Some(val),
-                    Some("administrativeState") => out.admin_state = Some(val),
+                    Some("id") => {
+                        if let Some(ref mut ed) = current_edit {
+                            ed.id = Some(val);
+                        }
+                    }
+                    Some("administrativeState") => {
+                        if let Some(ref mut ed) = current_edit {
+                            ed.administrative_state = Some(val);
+                        }
+                    }
+                    Some("gpuAcceleratorProfile") => {
+                        if let Some(ref mut ed) = current_edit {
+                            ed.gpu_accelerator_profile = Some(val);
+                        }
+                    }
+                    Some("aiRrmPolicyId") => {
+                        if let Some(ref mut ed) = current_edit {
+                            ed.ai_rrm_policy_id = Some(val);
+                        }
+                    }
                     Some("confirm-timeout") => out.confirm_timeout = Some(val),
                     Some("persist") => out.persist = Some(val),
                     Some("persist-id") => out.persist_id = Some(val),
                     Some("startTime") => out.start_time = Some(val),
                     Some("tx-id") | Some("txid") => out.tx_id = Some(val),
                     Some("traceparent") => out.traceparent = Some(val),
+                    Some("writer-origin") => {
+                        if let Some(wo) = WriterOrigin::parse_str(&val) {
+                            out.writer_origin = Some(wo);
+                        } else {
+                            out.invalid_writer_origin = Some(val);
+                        }
+                    }
                     _ => {}
                 }
             }
-            Ok(Event::End(_)) => {
+            Ok(Event::End(e)) => {
+                let name = local_name(e.name().as_ref());
+                if parse_managed_kind(&name).is_some() {
+                    if let Some(ed) = current_edit.take() {
+                        out.edits.push(ed.into_object_edit());
+                    }
+                }
                 stack.pop();
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -660,5 +759,52 @@ mod tests {
         assert!(res_verify.reply_xml.contains("<chain-valid>true</chain-valid>"));
         assert!(res_verify.reply_xml.contains("<entries>2</entries>"));
         assert!(res_verify.reply_xml.contains("<head-hash>"));
+    }
+
+    #[tokio::test]
+    async fn rpc_ocu_gpu_airan_and_invalid_profile_validation() {
+        let dir = tempdir().unwrap();
+        let engine = DatastoreEngine::open(dir.path().join("state.json"), true).unwrap();
+        let sid = engine.allocate_session_id().await.unwrap();
+
+        assert!(build_server_hello(sid).contains("urn:3gpp:sa5:_3gpp-nr-nrm-nrcellcu"));
+
+        let edit_ocu = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"501\" tx-id=\"tx-ocu-1\">\
+               <edit-config><target><running/></target><config>\
+                 <ManagedElement xmlns=\"urn:3gpp:sa5:_3gpp-nr-nrm-nrcellcu\">\
+                   <GNBCUCPFunction><id>cucp-1</id><attributes><administrativeState>UNLOCKED</administrativeState></attributes></GNBCUCPFunction>\
+                   <GNBCUUPFunction><id>cuup-1</id><attributes><gpuAcceleratorProfile>DOCA_DPU</gpuAcceleratorProfile></attributes></GNBCUUPFunction>\
+                   <NRCellCU><id>cu-cell-1</id><attributes><administrativeState>UNLOCKED</administrativeState><gpuAcceleratorProfile>AERIAL_CUDA</gpuAcceleratorProfile><aiRrmPolicyId>rrm-v3</aiRrmPolicyId></attributes></NRCellCU>\
+                 </ManagedElement>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        let res = handle_rpc(&edit_ocu, &engine, "smo", sid, None).await;
+        assert!(res.reply_xml.contains("tx-id=\"tx-ocu-1\"") && res.reply_xml.contains("<ok/>"));
+
+        let get_prov = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"502\">\
+               <get-config><source><running/></source><with-provenance/></get-config>\
+             </rpc>"
+        );
+        let res_get = handle_rpc(&get_prov, &engine, "smo", sid, None).await;
+        assert!(res_get.reply_xml.contains("<GNBCUCPFunction><id>cucp-1</id>"));
+        assert!(res_get.reply_xml.contains("<GNBCUUPFunction><id>cuup-1</id>"));
+        assert!(res_get.reply_xml.contains("<NRCellCU><id>cu-cell-1</id>"));
+        assert!(res_get.reply_xml.contains("o1p:tx-id=\"tx-ocu-1\""));
+
+        // Invalid gpuAcceleratorProfile fails cleanly with invalid-value
+        let bad_gpu = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"503\">\
+               <edit-config><target><running/></target><config>\
+                 <ManagedElement xmlns=\"urn:3gpp:sa5:_3gpp-nr-nrm-nrcellcu\">\
+                   <NRCellCU><id>cu-cell-1</id><attributes><gpuAcceleratorProfile>INVALID_GPU</gpuAcceleratorProfile></attributes></NRCellCU>\
+                 </ManagedElement>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        let res_bad = handle_rpc(&bad_gpu, &engine, "smo", sid, None).await;
+        assert!(res_bad.reply_xml.contains("<error-tag>invalid-value</error-tag>"));
     }
 }

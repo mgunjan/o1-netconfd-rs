@@ -51,6 +51,7 @@ pub fn build_ves_notify_moi_changes(record: &NotificationRecord) -> Option<Value
         changed_by,
         datastore,
         targets,
+        writer_origin,
         tx_id,
         traceparent,
     } = &record.payload
@@ -86,6 +87,7 @@ pub fn build_ves_notify_moi_changes(record: &NotificationRecord) -> Option<Value
         "writerPrincipal": writer_principal,
         "sessionId": session_id,
         "changedBy": changed_by_kind,
+        "writerOrigin": writer_origin.as_str(),
         "txId": tx_id.clone().map(Value::from).unwrap_or(Value::Null),
         "traceparent": traceparent.clone().map(Value::from).unwrap_or(Value::Null),
         "auditEntryHash": record.entry_hash,
@@ -217,6 +219,7 @@ mod tests {
                 changed_by: ChangedBy::Server,
                 datastore: "running".to_string(),
                 targets: vec!["/demo-nrcelldu:managed-element/NRCellDU[id='cell-1']/attributes/administrativeState".to_string()],
+                writer_origin: crate::datastore::WriterOrigin::ServerRollback,
                 tx_id: None,
                 traceparent: None,
             },
@@ -289,6 +292,7 @@ mod tests {
                 WriteMeta {
                     tx_id: Some("ves-tx-77".into()),
                     traceparent: Some("00-99999999999999999999999999999999-8888888888888888-01".into()),
+                    ..Default::default()
                 },
             )
             .await
