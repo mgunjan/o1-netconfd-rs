@@ -226,6 +226,35 @@ pub async fn handle_rpc(
                 subscription: Some(sub),
             }
         }
+        Some("verify-provenance-chain") => {
+            let report = engine.verify_audit_chain().await;
+            let tampered = report
+                .tampered_seq
+                .map(|s| format!("<tampered-seq>{s}</tampered-seq>"))
+                .unwrap_or_default();
+            let reason = report
+                .reason
+                .as_deref()
+                .map(|r| format!("<reason>{}</reason>", xml_escape(r)))
+                .unwrap_or_default();
+            RpcOutcome {
+                reply_xml: format!(
+                    "<rpc-reply xmlns=\"{NETCONF_BASE_NS}\" message-id=\"{msg_id}\"{tx_attr}>\
+                       <provenance-chain-status xmlns=\"urn:o1:provenance:1.0\">\
+                         <chain-valid>{}</chain-valid>\
+                         <entries>{}</entries>\
+                         <head-hash>{}</head-hash>\
+                         {tampered}{reason}\
+                       </provenance-chain-status>\
+                     </rpc-reply>",
+                    report.valid,
+                    report.entries,
+                    xml_escape(&report.head_hash),
+                ),
+                close_after: false,
+                subscription: None,
+            }
+        }
         other => RpcOutcome {
             reply_xml: wrap_err(NetconfError::invalid_value(format!(
                 "Unsupported RPC operation: {:?}",
@@ -622,5 +651,14 @@ mod tests {
         assert!(res_h2.reply_xml.contains("o1p:owner=\"ops2\""));
         assert!(res_h2.reply_xml.contains(&format!("o1p:session-id=\"{sid_ops2}\"")));
         assert!(res_h2.reply_xml.contains("o1p:tx-id=\"tx-h2-ops2\""));
+
+        // <verify-provenance-chain/> verifies integrity across recorded notifications
+        let verify_rpc = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"407\"><verify-provenance-chain/></rpc>"
+        );
+        let res_verify = handle_rpc(&verify_rpc, &engine, "smo", sid_smo, None).await;
+        assert!(res_verify.reply_xml.contains("<chain-valid>true</chain-valid>"));
+        assert!(res_verify.reply_xml.contains("<entries>2</entries>"));
+        assert!(res_verify.reply_xml.contains("<head-hash>"));
     }
 }
