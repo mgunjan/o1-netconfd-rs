@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
 pub const DEMO_NS: &str = "urn:demo:o1:nrcelldu";
+pub const PROVENANCE_NS: &str = "urn:o1:provenance:1.0";
 pub const NOTIF_WRAP_NS: &str = "urn:ietf:params:xml:ns:netconf:notification:1.0";
 pub const REPLAY_MOD_NS: &str = "urn:ietf:params:xml:ns:netmod:notification";
 pub const RFC6470_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications";
@@ -81,12 +82,37 @@ pub enum ChangedBy {
     },
 }
 
+/// Optional IETF transaction-id and W3C traceparent propagated on NETCONF write RPCs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriteMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+}
+
+/// Per-cell RFC 7952 causal ownership metadata persisted alongside running state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeafProvenance {
+    pub owner_principal: String,
+    pub owner_session_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NotificationPayload {
     ConfigChange {
         changed_by: ChangedBy,
         datastore: String,
         targets: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tx_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        traceparent: Option<String>,
     },
     ConfirmedCommit {
         confirm_event: String,
@@ -109,6 +135,8 @@ impl NotificationRecord {
                 changed_by,
                 datastore,
                 targets,
+                tx_id,
+                traceparent,
             } => {
                 let cb_xml = match changed_by {
                     ChangedBy::Server => "<changed-by><server/></changed-by>".to_string(),
@@ -133,8 +161,16 @@ impl NotificationRecord {
                     .iter()
                     .map(|t| format!("<edit><target>{}</target><operation>replace</operation></edit>", xml_escape(t)))
                     .collect();
+                let tx_xml = tx_id
+                    .as_ref()
+                    .map(|t| format!("<tx-id>{}</tx-id>", xml_escape(t)))
+                    .unwrap_or_default();
+                let tp_xml = traceparent
+                    .as_ref()
+                    .map(|t| format!("<traceparent>{}</traceparent>", xml_escape(t)))
+                    .unwrap_or_default();
                 format!(
-                    "<netconf-config-change xmlns=\"{RFC6470_NS}\">{cb_xml}<datastore>{}</datastore>{edits_xml}</netconf-config-change>",
+                    "<netconf-config-change xmlns=\"{RFC6470_NS}\">{cb_xml}<datastore>{}</datastore>{edits_xml}{tx_xml}{tp_xml}</netconf-config-change>",
                     xml_escape(datastore)
                 )
             }
@@ -172,6 +208,8 @@ pub enum PendingCommitState {
         owner_session_id: u64,
         deadline_ms: i64,
         rollback_cells: BTreeMap<String, String>,
+        #[serde(default)]
+        rollback_provenance: BTreeMap<String, LeafProvenance>,
     },
 }
 
@@ -179,6 +217,8 @@ pub enum PendingCommitState {
 pub struct PersistedStore {
     pub next_session_id: u64,
     pub running_cells: BTreeMap<String, String>,
+    #[serde(default)]
+    pub running_provenance: BTreeMap<String, LeafProvenance>,
     pub pending_commit: PendingCommitState,
     pub notifications: Vec<NotificationRecord>,
 }
@@ -190,6 +230,7 @@ impl Default for PersistedStore {
         Self {
             next_session_id: 1,
             running_cells,
+            running_provenance: BTreeMap::new(),
             pending_commit: PendingCommitState::Idle,
             notifications: Vec::new(),
         }
@@ -199,6 +240,8 @@ impl Default for PersistedStore {
 struct InnerState {
     persisted: PersistedStore,
     candidate_cells: BTreeMap<String, String>,
+    candidate_provenance: BTreeMap<String, LeafProvenance>,
+    candidate_dirty: std::collections::BTreeSet<String>,
     candidate_lock: Option<u64>,
     running_lock: Option<u64>,
 }
@@ -231,13 +274,15 @@ impl DatastoreEngine {
         // Crash / restart recovery: atomic rollback + PendingCommitState::Idle clearing
         if let PendingCommitState::Pending {
             rollback_cells,
+            rollback_provenance,
             owner_user,
             owner_session_id,
             ..
         } = persisted.pending_commit.clone()
         {
-            let changed = persisted.running_cells != rollback_cells;
+            let changed_targets = diff_cell_targets(&persisted.running_cells, &rollback_cells);
             persisted.running_cells = rollback_cells;
+            persisted.running_provenance = rollback_provenance;
             persisted.pending_commit = PendingCommitState::Idle;
 
             let now = Utc::now();
@@ -249,13 +294,15 @@ impl DatastoreEngine {
                     session_id: Some(owner_session_id),
                 },
             });
-            if changed {
+            if !changed_targets.is_empty() {
                 persisted.notifications.push(NotificationRecord {
                     event_time: now,
                     payload: NotificationPayload::ConfigChange {
                         changed_by: ChangedBy::Server,
                         datastore: "running".to_string(),
-                        targets: vec!["/demo-nrcelldu:managed-element/NRCellDU[id='cell-1']/attributes/administrativeState".to_string()],
+                        targets: changed_targets,
+                        tx_id: None,
+                        traceparent: None,
                     },
                 });
             }
@@ -264,6 +311,7 @@ impl DatastoreEngine {
         atomic_write_json(&state_path, &persisted)?;
 
         let candidate_cells = persisted.running_cells.clone();
+        let candidate_provenance = persisted.running_provenance.clone();
         let (notif_tx, _) = broadcast::channel(256);
         let engine = Self {
             state_path,
@@ -271,6 +319,8 @@ impl DatastoreEngine {
             inner: Arc::new(Mutex::new(InnerState {
                 persisted,
                 candidate_cells,
+                candidate_provenance,
+                candidate_dirty: std::collections::BTreeSet::new(),
                 candidate_lock: None,
                 running_lock: None,
             })),
@@ -297,15 +347,19 @@ impl DatastoreEngine {
         if let PendingCommitState::Pending {
             deadline_ms,
             rollback_cells,
+            rollback_provenance,
             owner_user,
             owner_session_id,
             ..
         } = guard.persisted.pending_commit.clone()
         {
             if now_ms >= deadline_ms {
-                let changed = guard.persisted.running_cells != rollback_cells;
+                let changed_targets = diff_cell_targets(&guard.persisted.running_cells, &rollback_cells);
                 guard.persisted.running_cells = rollback_cells.clone();
+                guard.persisted.running_provenance = rollback_provenance.clone();
                 guard.candidate_cells = rollback_cells;
+                guard.candidate_provenance = rollback_provenance;
+                guard.candidate_dirty.clear();
                 guard.persisted.pending_commit = PendingCommitState::Idle;
 
                 let ev1 = NotificationRecord {
@@ -319,13 +373,15 @@ impl DatastoreEngine {
                 guard.persisted.notifications.push(ev1.clone());
                 let _ = self.notif_tx.send(ev1);
 
-                if changed {
+                if !changed_targets.is_empty() {
                     let ev2 = NotificationRecord {
                         event_time: Utc::now(),
                         payload: NotificationPayload::ConfigChange {
                             changed_by: ChangedBy::Server,
                             datastore: "running".to_string(),
-                            targets: vec!["/demo-nrcelldu:managed-element/NRCellDU[id='cell-1']/attributes/administrativeState".to_string()],
+                            targets: changed_targets,
+                            tx_id: None,
+                            traceparent: None,
                         },
                     };
                     guard.persisted.notifications.push(ev2.clone());
@@ -359,14 +415,18 @@ impl DatastoreEngine {
             persist_id: None,
             owner_session_id,
             rollback_cells,
+            rollback_provenance,
             owner_user,
             ..
         } = guard.persisted.pending_commit.clone()
         {
             if owner_session_id == session_id {
-                let changed = guard.persisted.running_cells != rollback_cells;
+                let changed_targets = diff_cell_targets(&guard.persisted.running_cells, &rollback_cells);
                 guard.persisted.running_cells = rollback_cells.clone();
+                guard.persisted.running_provenance = rollback_provenance.clone();
                 guard.candidate_cells = rollback_cells;
+                guard.candidate_provenance = rollback_provenance;
+                guard.candidate_dirty.clear();
                 guard.persisted.pending_commit = PendingCommitState::Idle;
                 let ev1 = NotificationRecord {
                     event_time: Utc::now(),
@@ -378,13 +438,15 @@ impl DatastoreEngine {
                 };
                 guard.persisted.notifications.push(ev1.clone());
                 let _ = self.notif_tx.send(ev1);
-                if changed {
+                if !changed_targets.is_empty() {
                     let ev2 = NotificationRecord {
                         event_time: Utc::now(),
                         payload: NotificationPayload::ConfigChange {
                             changed_by: ChangedBy::Server,
                             datastore: "running".to_string(),
-                            targets: vec!["/demo-nrcelldu:managed-element/NRCellDU[id='cell-1']/attributes/administrativeState".to_string()],
+                            targets: changed_targets,
+                            tx_id: None,
+                            traceparent: None,
                         },
                     };
                     guard.persisted.notifications.push(ev2.clone());
@@ -397,13 +459,24 @@ impl DatastoreEngine {
     }
 
     pub async fn get_config_xml(&self, source: &str) -> Result<String, NetconfError> {
+        self.get_config_xml_with_provenance(source, false).await
+    }
+
+    pub async fn get_config_xml_with_provenance(
+        &self,
+        source: &str,
+        with_provenance: bool,
+    ) -> Result<String, NetconfError> {
         let guard = self.inner.lock().await;
-        let map = match source {
-            "running" => &guard.persisted.running_cells,
-            "candidate" => &guard.candidate_cells,
+        let (map, prov) = match source {
+            "running" => (&guard.persisted.running_cells, &guard.persisted.running_provenance),
+            "candidate" => (&guard.candidate_cells, &guard.candidate_provenance),
             other => return Err(NetconfError::invalid_value(format!("Unsupported datastore: {other}"))),
         };
-        Ok(render_cells_xml(map))
+        Ok(render_cells_xml_with_provenance(
+            map,
+            if with_provenance { Some(prov) } else { None },
+        ))
     }
 
     pub async fn lock(&self, target: &str, session_id: u64) -> Result<(), NetconfError> {
@@ -448,6 +521,8 @@ impl DatastoreEngine {
             }
         }
         guard.candidate_cells = guard.persisted.running_cells.clone();
+        guard.candidate_provenance = guard.persisted.running_provenance.clone();
+        guard.candidate_dirty.clear();
         Ok(())
     }
 
@@ -460,12 +535,43 @@ impl DatastoreEngine {
         session_id: u64,
         source_host: Option<String>,
     ) -> Result<(), NetconfError> {
+        self.edit_config_with_meta(
+            target,
+            cell_id,
+            admin_state,
+            username,
+            session_id,
+            source_host,
+            WriteMeta::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn edit_config_with_meta(
+        &self,
+        target: &str,
+        cell_id: &str,
+        admin_state: &str,
+        username: &str,
+        session_id: u64,
+        source_host: Option<String>,
+        meta: WriteMeta,
+    ) -> Result<(), NetconfError> {
         if !matches!(admin_state, "LOCKED" | "UNLOCKED" | "SHUTTINGDOWN") {
             return Err(NetconfError::invalid_value(format!(
                 "Invalid administrativeState: {admin_state}"
             )));
         }
         let mut guard = self.inner.lock().await;
+        let now = Utc::now();
+        let prov = LeafProvenance {
+            owner_principal: username.to_string(),
+            owner_session_id: session_id,
+            tx_id: meta.tx_id.clone(),
+            traceparent: meta.traceparent.clone(),
+            updated_at: now,
+        };
         match target {
             "candidate" => {
                 if let Some(holder) = guard.candidate_lock {
@@ -474,6 +580,8 @@ impl DatastoreEngine {
                     }
                 }
                 guard.candidate_cells.insert(cell_id.to_string(), admin_state.to_string());
+                guard.candidate_provenance.insert(cell_id.to_string(), prov);
+                guard.candidate_dirty.insert(cell_id.to_string());
                 Ok(())
             }
             "running" => {
@@ -484,11 +592,14 @@ impl DatastoreEngine {
                 }
                 let prev = guard.persisted.running_cells.get(cell_id).cloned();
                 guard.persisted.running_cells.insert(cell_id.to_string(), admin_state.to_string());
+                guard.persisted.running_provenance.insert(cell_id.to_string(), prov.clone());
                 guard.candidate_cells.insert(cell_id.to_string(), admin_state.to_string());
+                guard.candidate_provenance.insert(cell_id.to_string(), prov);
+                guard.candidate_dirty.remove(cell_id);
 
                 if prev.as_deref() != Some(admin_state) {
                     let ev = NotificationRecord {
-                        event_time: Utc::now(),
+                        event_time: now,
                         payload: NotificationPayload::ConfigChange {
                             changed_by: ChangedBy::Session {
                                 username: username.to_string(),
@@ -496,9 +607,9 @@ impl DatastoreEngine {
                                 source_host,
                             },
                             datastore: "running".to_string(),
-                            targets: vec![format!(
-                                "/demo-nrcelldu:managed-element/NRCellDU[id='{cell_id}']/attributes/administrativeState"
-                            )],
+                            targets: vec![cell_target_path(cell_id)],
+                            tx_id: meta.tx_id,
+                            traceparent: meta.traceparent,
                         },
                     };
                     guard.persisted.notifications.push(ev.clone());
@@ -522,6 +633,31 @@ impl DatastoreEngine {
         username: &str,
         session_id: u64,
         source_host: Option<String>,
+    ) -> Result<(), NetconfError> {
+        self.commit_with_meta(
+            confirmed,
+            timeout_secs,
+            persist,
+            persist_id,
+            username,
+            session_id,
+            source_host,
+            WriteMeta::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_with_meta(
+        &self,
+        confirmed: bool,
+        timeout_secs: u64,
+        persist: Option<String>,
+        persist_id: Option<String>,
+        username: &str,
+        session_id: u64,
+        source_host: Option<String>,
+        meta: WriteMeta,
     ) -> Result<(), NetconfError> {
         let mut guard = self.inner.lock().await;
 
@@ -555,6 +691,7 @@ impl DatastoreEngine {
                 // Extending timeout on an active persistent confirmed commit
                 if let PendingCommitState::Pending {
                     rollback_cells,
+                    rollback_provenance,
                     owner_user,
                     owner_session_id,
                     ..
@@ -568,6 +705,7 @@ impl DatastoreEngine {
                         owner_session_id,
                         deadline_ms,
                         rollback_cells,
+                        rollback_provenance,
                     };
                     let ev = NotificationRecord {
                         event_time: Utc::now(),
@@ -582,11 +720,11 @@ impl DatastoreEngine {
                 }
             } else {
                 // Finalizing the pending confirmed commit
-                let changed = guard.persisted.running_cells != guard.candidate_cells;
-                guard.persisted.running_cells = guard.candidate_cells.clone();
+                let (changed_targets, resolved_meta) =
+                    promote_candidate_to_running(&mut guard, username, session_id, &meta);
                 guard.persisted.pending_commit = PendingCommitState::Idle;
 
-                if changed {
+                if !changed_targets.is_empty() {
                     let ev_cc = NotificationRecord {
                         event_time: Utc::now(),
                         payload: NotificationPayload::ConfigChange {
@@ -596,7 +734,9 @@ impl DatastoreEngine {
                                 source_host,
                             },
                             datastore: "running".to_string(),
-                            targets: vec!["/demo-nrcelldu:managed-element/NRCellDU[id='cell-1']/attributes/administrativeState".to_string()],
+                            targets: changed_targets,
+                            tx_id: resolved_meta.tx_id,
+                            traceparent: resolved_meta.traceparent,
                         },
                     };
                     guard.persisted.notifications.push(ev_cc.clone());
@@ -621,12 +761,19 @@ impl DatastoreEngine {
 
         // Case 2: Starting a new confirmed commit (<commit><confirmed/>...</commit>)
         if confirmed {
-            let rollback_cells = match &guard.persisted.pending_commit {
-                PendingCommitState::Idle => guard.persisted.running_cells.clone(),
-                PendingCommitState::Pending { rollback_cells, .. } => rollback_cells.clone(),
+            let (rollback_cells, rollback_provenance) = match &guard.persisted.pending_commit {
+                PendingCommitState::Idle => (
+                    guard.persisted.running_cells.clone(),
+                    guard.persisted.running_provenance.clone(),
+                ),
+                PendingCommitState::Pending {
+                    rollback_cells,
+                    rollback_provenance,
+                    ..
+                } => (rollback_cells.clone(), rollback_provenance.clone()),
             };
-            let changed = guard.persisted.running_cells != guard.candidate_cells;
-            guard.persisted.running_cells = guard.candidate_cells.clone();
+            let (changed_targets, resolved_meta) =
+                promote_candidate_to_running(&mut guard, username, session_id, &meta);
             let deadline_ms = Utc::now().timestamp_millis() + (timeout_secs as i64 * 1000);
             guard.persisted.pending_commit = PendingCommitState::Pending {
                 persist_id: persist,
@@ -634,9 +781,10 @@ impl DatastoreEngine {
                 owner_session_id: session_id,
                 deadline_ms,
                 rollback_cells,
+                rollback_provenance,
             };
 
-            if changed {
+            if !changed_targets.is_empty() {
                 let ev_cc = NotificationRecord {
                     event_time: Utc::now(),
                     payload: NotificationPayload::ConfigChange {
@@ -646,7 +794,9 @@ impl DatastoreEngine {
                             source_host,
                         },
                         datastore: "running".to_string(),
-                        targets: vec!["/demo-nrcelldu:managed-element/NRCellDU[id='cell-1']/attributes/administrativeState".to_string()],
+                        targets: changed_targets,
+                        tx_id: resolved_meta.tx_id,
+                        traceparent: resolved_meta.traceparent,
                     },
                 };
                 guard.persisted.notifications.push(ev_cc.clone());
@@ -674,12 +824,12 @@ impl DatastoreEngine {
             &guard.persisted.pending_commit,
             PendingCommitState::Pending { persist_id: None, owner_session_id, .. } if *owner_session_id == session_id
         );
-        let changed = guard.persisted.running_cells != guard.candidate_cells;
-        guard.persisted.running_cells = guard.candidate_cells.clone();
+        let (changed_targets, resolved_meta) =
+            promote_candidate_to_running(&mut guard, username, session_id, &meta);
         if was_pending {
             guard.persisted.pending_commit = PendingCommitState::Idle;
         }
-        if changed {
+        if !changed_targets.is_empty() {
             let ev_cc = NotificationRecord {
                 event_time: Utc::now(),
                 payload: NotificationPayload::ConfigChange {
@@ -689,7 +839,9 @@ impl DatastoreEngine {
                         source_host,
                     },
                     datastore: "running".to_string(),
-                    targets: vec!["/demo-nrcelldu:managed-element/NRCellDU[id='cell-1']/attributes/administrativeState".to_string()],
+                    targets: changed_targets,
+                    tx_id: resolved_meta.tx_id,
+                    traceparent: resolved_meta.traceparent,
                 },
             };
             guard.persisted.notifications.push(ev_cc.clone());
@@ -719,7 +871,7 @@ impl DatastoreEngine {
         session_id: u64,
     ) -> Result<(), NetconfError> {
         let mut guard = self.inner.lock().await;
-        let (rollback_cells, owner_user) = match &guard.persisted.pending_commit {
+        let (rollback_cells, rollback_provenance, owner_user) = match &guard.persisted.pending_commit {
             PendingCommitState::Idle => {
                 return Err(NetconfError::invalid_value("No confirmed commit is pending"));
             }
@@ -728,6 +880,7 @@ impl DatastoreEngine {
                 owner_user,
                 owner_session_id,
                 rollback_cells,
+                rollback_provenance,
                 ..
             } => {
                 match (&persist_id, active_pid) {
@@ -744,13 +897,20 @@ impl DatastoreEngine {
                         "cancel-commit persist-id belongs to a different principal",
                     ));
                 }
-                (rollback_cells.clone(), owner_user.clone())
+                (
+                    rollback_cells.clone(),
+                    rollback_provenance.clone(),
+                    owner_user.clone(),
+                )
             }
         };
 
-        let changed = guard.persisted.running_cells != rollback_cells;
+        let changed_targets = diff_cell_targets(&guard.persisted.running_cells, &rollback_cells);
         guard.persisted.running_cells = rollback_cells.clone();
+        guard.persisted.running_provenance = rollback_provenance.clone();
         guard.candidate_cells = rollback_cells;
+        guard.candidate_provenance = rollback_provenance;
+        guard.candidate_dirty.clear();
         guard.persisted.pending_commit = PendingCommitState::Idle;
 
         let ev1 = NotificationRecord {
@@ -764,7 +924,7 @@ impl DatastoreEngine {
         guard.persisted.notifications.push(ev1.clone());
         let _ = self.notif_tx.send(ev1);
 
-        if changed {
+        if !changed_targets.is_empty() {
             let ev2 = NotificationRecord {
                 event_time: Utc::now(),
                 payload: NotificationPayload::ConfigChange {
@@ -774,7 +934,9 @@ impl DatastoreEngine {
                         source_host: None,
                     },
                     datastore: "running".to_string(),
-                    targets: vec!["/demo-nrcelldu:managed-element/NRCellDU[id='cell-1']/attributes/administrativeState".to_string()],
+                    targets: changed_targets,
+                    tx_id: None,
+                    traceparent: None,
                 },
             };
             guard.persisted.notifications.push(ev2.clone());
@@ -803,11 +965,112 @@ impl DatastoreEngine {
     }
 }
 
+fn cell_target_path(cell_id: &str) -> String {
+    format!(
+        "/demo-nrcelldu:managed-element/NRCellDU[id='{cell_id}']/attributes/administrativeState"
+    )
+}
+
+fn diff_cell_targets(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut keys: std::collections::BTreeSet<&str> = before.keys().map(|s| s.as_str()).collect();
+    keys.extend(after.keys().map(|s| s.as_str()));
+    keys.into_iter()
+        .filter(|k| before.get(*k) != after.get(*k))
+        .map(cell_target_path)
+        .collect()
+}
+
+fn promote_candidate_to_running(
+    guard: &mut InnerState,
+    username: &str,
+    session_id: u64,
+    commit_meta: &WriteMeta,
+) -> (Vec<String>, WriteMeta) {
+    let changed_targets = diff_cell_targets(&guard.persisted.running_cells, &guard.candidate_cells);
+    let now = Utc::now();
+    let mut resolved_tx = commit_meta.tx_id.clone();
+    let mut resolved_tp = commit_meta.traceparent.clone();
+
+    let candidate_snapshot = guard.candidate_cells.clone();
+    for (cell_id, val) in &candidate_snapshot {
+        let value_changed = guard.persisted.running_cells.get(cell_id) != Some(val);
+        let dirty = guard.candidate_dirty.contains(cell_id);
+        if value_changed || dirty {
+            let cand_prov = guard.candidate_provenance.get(cell_id);
+            let tx_id = commit_meta
+                .tx_id
+                .clone()
+                .or_else(|| cand_prov.and_then(|p| p.tx_id.clone()));
+            let traceparent = commit_meta
+                .traceparent
+                .clone()
+                .or_else(|| cand_prov.and_then(|p| p.traceparent.clone()));
+            if resolved_tx.is_none() {
+                resolved_tx = tx_id.clone();
+            }
+            if resolved_tp.is_none() {
+                resolved_tp = traceparent.clone();
+            }
+            let prov = LeafProvenance {
+                owner_principal: username.to_string(),
+                owner_session_id: session_id,
+                tx_id,
+                traceparent,
+                updated_at: now,
+            };
+            guard
+                .persisted
+                .running_provenance
+                .insert(cell_id.clone(), prov.clone());
+            guard.candidate_provenance.insert(cell_id.clone(), prov);
+        }
+    }
+
+    guard.persisted.running_cells = candidate_snapshot;
+    guard.candidate_dirty.clear();
+    (
+        changed_targets,
+        WriteMeta {
+            tx_id: resolved_tx,
+            traceparent: resolved_tp,
+        },
+    )
+}
+
 pub fn render_cells_xml(cells: &BTreeMap<String, String>) -> String {
+    render_cells_xml_with_provenance(cells, None)
+}
+
+pub fn render_cells_xml_with_provenance(
+    cells: &BTreeMap<String, String>,
+    provenance: Option<&BTreeMap<String, LeafProvenance>>,
+) -> String {
     let mut inner = String::new();
     for (id, state) in cells {
+        let prov_attrs = provenance
+            .and_then(|map| map.get(id))
+            .map(|p| {
+                let mut attrs = format!(
+                    " xmlns:o1p=\"{PROVENANCE_NS}\" o1p:owner=\"{}\" o1p:session-id=\"{}\" o1p:updated-at=\"{}\"",
+                    xml_escape(&p.owner_principal),
+                    p.owner_session_id,
+                    p.updated_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                );
+                if let Some(ref tx) = p.tx_id {
+                    attrs.push_str(&format!(" o1p:tx-id=\"{}\"", xml_escape(tx)));
+                }
+                if let Some(ref tp) = p.traceparent {
+                    attrs.push_str(&format!(" o1p:traceparent=\"{}\"", xml_escape(tp)));
+                }
+                attrs
+            })
+            .unwrap_or_default();
+
         inner.push_str(&format!(
-            "<NRCellDU><id>{}</id><attributes><administrativeState>{}</administrativeState></attributes></NRCellDU>",
+            "<NRCellDU><id>{}</id><attributes><administrativeState{prov_attrs}>{}</administrativeState></attributes></NRCellDU>",
             xml_escape(id),
             xml_escape(state)
         ));
@@ -1048,5 +1311,79 @@ mod tests {
             .await
             .unwrap()
             .contains("LOCKED"));
+    }
+
+    #[tokio::test]
+    async fn leaf_provenance_persists_rolls_back_and_migrates_legacy_json() {
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("legacy_state.json");
+
+        // 1. Legacy JSON without running_provenance/rollback_provenance/tx_id loads cleanly
+        let legacy_json = r#"{
+          "next_session_id": 5,
+          "running_cells": { "cell-1": "UNLOCKED" },
+          "pending_commit": "Idle",
+          "notifications": []
+        }"#;
+        std::fs::write(&state_file, legacy_json).unwrap();
+
+        let eng = DatastoreEngine::open(&state_file, true).unwrap();
+        let sid_smo = eng.allocate_session_id().await.unwrap();
+        assert_eq!(sid_smo, 5);
+        assert!(eng
+            .get_config_xml_with_provenance("running", false)
+            .await
+            .unwrap()
+            .contains("<administrativeState>UNLOCKED</administrativeState>"));
+
+        // 2. Write with tx_id + traceparent on candidate -> confirmed commit -> provenance updated
+        eng.edit_config_with_meta(
+            "candidate",
+            "cell-1",
+            "LOCKED",
+            "smo",
+            sid_smo,
+            None,
+            WriteMeta {
+                tx_id: Some("tx-edit-100".into()),
+                traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+            },
+        )
+        .await
+        .unwrap();
+        eng.commit_with_meta(
+            true,
+            300,
+            Some("prov-tok".into()),
+            None,
+            "smo",
+            sid_smo,
+            None,
+            WriteMeta::default(),
+        )
+        .await
+        .unwrap();
+
+        let with_prov = eng
+            .get_config_xml_with_provenance("running", true)
+            .await
+            .unwrap();
+        assert!(with_prov.contains("xmlns:o1p=\"urn:o1:provenance:1.0\""));
+        assert!(with_prov.contains("o1p:owner=\"smo\""));
+        assert!(with_prov.contains("o1p:session-id=\"5\""));
+        assert!(with_prov.contains("o1p:tx-id=\"tx-edit-100\""));
+        assert!(with_prov.contains("o1p:traceparent=\"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\""));
+        assert!(with_prov.contains("o1p:updated-at="));
+
+        // 3. Cancel commit restores running_cells AND running_provenance back to pre-commit state
+        eng.cancel_commit(Some("prov-tok".into()), "smo", sid_smo)
+            .await
+            .unwrap();
+        let after_cancel = eng
+            .get_config_xml_with_provenance("running", true)
+            .await
+            .unwrap();
+        assert!(after_cancel.contains("<administrativeState>UNLOCKED</administrativeState>"));
+        assert!(!after_cancel.contains("o1p:tx-id=\"tx-edit-100\""));
     }
 }
