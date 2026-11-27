@@ -1,6 +1,7 @@
 //! `o1-netconfd-rs`: Memory-safe, crash-consistent Rust NETCONF server for O-RAN O1 / M-Plane.
 
 pub mod datastore;
+pub mod fault_proxy;
 pub mod framing;
 pub mod rpc;
 pub mod ssh;

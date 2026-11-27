@@ -451,4 +451,53 @@ mod tests {
         let res = handle_rpc(&unsupported, &engine, "smo", sid, None).await;
         assert!(res.reply_xml.contains("<error-tag>invalid-value</error-tag>"));
     }
+
+    #[tokio::test]
+    async fn rpc_strict_persist_owner_denies_cross_principal_t6() {
+        let dir = tempdir().unwrap();
+        let engine = DatastoreEngine::open(dir.path().join("state.json"), true).unwrap();
+        let sid_smo = engine.allocate_session_id().await.unwrap();
+        let sid_ops2 = engine.allocate_session_id().await.unwrap();
+
+        let edit_cand = edit_cell_rpc("301", "candidate", "UNLOCKED");
+        assert!(handle_rpc(&edit_cand, &engine, "smo", sid_smo, None)
+            .await
+            .reply_xml
+            .contains("<ok/>"));
+
+        let confirmed = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"302\">\
+               <commit><confirmed/><confirm-timeout>300</confirm-timeout><persist>rpc-t6-tok</persist></commit>\
+             </rpc>"
+        );
+        assert!(handle_rpc(&confirmed, &engine, "smo", sid_smo, None)
+            .await
+            .reply_xml
+            .contains("<ok/>"));
+
+        let hijack_cancel = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"303\">\
+               <cancel-commit><persist-id>rpc-t6-tok</persist-id></cancel-commit>\
+             </rpc>"
+        );
+        let res_cancel = handle_rpc(&hijack_cancel, &engine, "ops2", sid_ops2, None).await;
+        assert!(res_cancel.reply_xml.contains("<error-tag>access-denied</error-tag>"));
+
+        let hijack_confirm = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"304\">\
+               <commit><persist-id>rpc-t6-tok</persist-id></commit>\
+             </rpc>"
+        );
+        let res_confirm = handle_rpc(&hijack_confirm, &engine, "ops2", sid_ops2, None).await;
+        assert!(res_confirm.reply_xml.contains("<error-tag>access-denied</error-tag>"));
+
+        // Owner smo succeeds
+        let owner_confirm = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"305\">\
+               <commit><persist-id>rpc-t6-tok</persist-id></commit>\
+             </rpc>"
+        );
+        let res_ok = handle_rpc(&owner_confirm, &engine, "smo", sid_smo, None).await;
+        assert!(res_ok.reply_xml.contains("<ok/>"));
+    }
 }

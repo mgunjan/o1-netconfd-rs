@@ -892,4 +892,161 @@ mod tests {
             .unwrap();
         assert_eq!(*last_cc, ChangedBy::Server);
     }
+
+    #[tokio::test]
+    async fn strict_persist_owner_rejects_cross_principal_t6() {
+        let dir = tempdir().unwrap();
+
+        // 1. With strict_persist_owner = true (--strict-persist-owner), ops2 cannot hijack smo's persist-id
+        let strict_path = dir.path().join("strict_state.json");
+        let eng = DatastoreEngine::open(&strict_path, true).unwrap();
+        let sid_smo = eng.allocate_session_id().await.unwrap();
+        let sid_ops2 = eng.allocate_session_id().await.unwrap();
+
+        eng.edit_config("candidate", "cell-1", "UNLOCKED", "smo", sid_smo, None)
+            .await
+            .unwrap();
+        eng.commit(
+            true,
+            300,
+            Some("smo-t6-tok".into()),
+            None,
+            "smo",
+            sid_smo,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(eng
+            .get_config_xml("running")
+            .await
+            .unwrap()
+            .contains("UNLOCKED"));
+
+        // ops2 attempts <cancel-commit> with smo's persist-id -> rejected with access-denied
+        let cancel_err = eng
+            .cancel_commit(Some("smo-t6-tok".into()), "ops2", sid_ops2)
+            .await
+            .unwrap_err();
+        assert_eq!(cancel_err.error_tag, "access-denied");
+        assert!(eng
+            .get_config_xml("running")
+            .await
+            .unwrap()
+            .contains("UNLOCKED"));
+
+        // ops2 attempts confirming <commit> with smo's persist-id -> rejected with access-denied
+        let confirm_err = eng
+            .commit(
+                false,
+                300,
+                None,
+                Some("smo-t6-tok".into()),
+                "ops2",
+                sid_ops2,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(confirm_err.error_tag, "access-denied");
+
+        // ops2 attempts extending <commit><confirmed/> with smo's persist-id -> rejected with access-denied
+        let extend_err = eng
+            .commit(
+                true,
+                600,
+                None,
+                Some("smo-t6-tok".into()),
+                "ops2",
+                sid_ops2,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(extend_err.error_tag, "access-denied");
+
+        // Original principal (smo) on a new session CAN confirm cleanly
+        let sid_smo_2 = eng.allocate_session_id().await.unwrap();
+        eng.commit(
+            false,
+            300,
+            None,
+            Some("smo-t6-tok".into()),
+            "smo",
+            sid_smo_2,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(eng
+            .get_config_xml("running")
+            .await
+            .unwrap()
+            .contains("UNLOCKED"));
+
+        // Also verify smo can cancel its own pending commit while ops2 cannot
+        eng.edit_config("candidate", "cell-1", "LOCKED", "smo", sid_smo_2, None)
+            .await
+            .unwrap();
+        eng.commit(
+            true,
+            300,
+            Some("smo-t6-tok-2".into()),
+            None,
+            "smo",
+            sid_smo_2,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(eng
+            .get_config_xml("running")
+            .await
+            .unwrap()
+            .contains("LOCKED"));
+        let cancel_err_2 = eng
+            .cancel_commit(Some("smo-t6-tok-2".into()), "ops2", sid_ops2)
+            .await
+            .unwrap_err();
+        assert_eq!(cancel_err_2.error_tag, "access-denied");
+        eng.cancel_commit(Some("smo-t6-tok-2".into()), "smo", sid_smo_2)
+            .await
+            .unwrap();
+        assert!(eng
+            .get_config_xml("running")
+            .await
+            .unwrap()
+            .contains("UNLOCKED"));
+
+        // 2. Contrast with strict_persist_owner = false (RFC 6241 bearer-token baseline): ops2 can cancel
+        let bearer_path = dir.path().join("bearer_state.json");
+        let eng_bearer = DatastoreEngine::open(&bearer_path, false).unwrap();
+        let b_smo = eng_bearer.allocate_session_id().await.unwrap();
+        let b_ops2 = eng_bearer.allocate_session_id().await.unwrap();
+        eng_bearer
+            .edit_config("candidate", "cell-1", "UNLOCKED", "smo", b_smo, None)
+            .await
+            .unwrap();
+        eng_bearer
+            .commit(
+                true,
+                300,
+                Some("bearer-tok".into()),
+                None,
+                "smo",
+                b_smo,
+                None,
+            )
+            .await
+            .unwrap();
+        eng_bearer
+            .cancel_commit(Some("bearer-tok".into()), "ops2", b_ops2)
+            .await
+            .unwrap();
+        assert!(eng_bearer
+            .get_config_xml("running")
+            .await
+            .unwrap()
+            .contains("LOCKED"));
+    }
 }
