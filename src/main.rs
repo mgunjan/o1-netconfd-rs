@@ -35,6 +35,10 @@ struct Cli {
     /// Out-of-band oracle helper: print running XML from `state_file` and exit
     #[arg(long, default_value_t = false)]
     dump_running: bool,
+
+    /// Verify tamper-evident SHA-256 hash-chained WAL integrity and exit
+    #[arg(long, default_value_t = false)]
+    verify_audit_chain: bool,
 }
 
 #[tokio::main]
@@ -51,6 +55,19 @@ async fn main() -> Result<()> {
             println!("{}", datastore::render_cells_xml(&store.running_cells));
         } else {
             println!("<managed-element xmlns=\"urn:demo:o1:nrcelldu\"><NRCellDU><id>cell-1</id><attributes><administrativeState>LOCKED</administrativeState></attributes></NRCellDU></managed-element>");
+        }
+        return Ok(());
+    }
+
+    if cli.verify_audit_chain {
+        let report = datastore::verify_audit_chain_file(&cli.state_file)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.valid {
+            anyhow::bail!(
+                "Audit chain verification failed at seq {:?}: {}",
+                report.tampered_seq,
+                report.reason.as_deref().unwrap_or("unknown error")
+            );
         }
         return Ok(());
     }
