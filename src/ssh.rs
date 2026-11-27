@@ -400,4 +400,112 @@ mod tests {
         let _ = session.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
         srv_task.abort();
     }
+
+    #[tokio::test]
+    async fn ssh_wire_with_provenance_distinguishes_h1_from_h2_without_replay() {
+        let dir = tempdir().unwrap();
+        let engine = DatastoreEngine::open(dir.path().join("state.json"), false).unwrap();
+        let mut users = HashMap::new();
+        users.insert("smo".to_string(), "smopass".to_string());
+        users.insert("ops2".to_string(), "ops2pass".to_string());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = Arc::new(build_server_config().unwrap());
+        let mut srv = NetconfSshServer {
+            engine,
+            users: Arc::new(users),
+        };
+        let srv_task = tokio::spawn(async move {
+            let _ = srv.run_on_socket(config, &listener).await;
+        });
+
+        // Helper closure to connect an SSH NETCONF session
+        let connect_user = |user: &'static str, pass: &'static str| async move {
+            let mut session = timeout(
+                Duration::from_secs(5),
+                russh::client::connect(Arc::new(russh::client::Config::default()), addr, TestClient),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(session.authenticate_password(user, pass).await.unwrap());
+            let mut channel = session.channel_open_session().await.unwrap();
+            channel.request_subsystem(true, "netconf").await.unwrap();
+            let mut rx_buf = Vec::new();
+            let server_hello = read_netconf_frame(&mut channel, &mut rx_buf, FramingMode::Base10).await;
+            assert!(server_hello.contains("urn:ietf:params:netconf:capability:with-provenance:1.0"));
+            assert!(server_hello.contains("urn:ietf:params:netconf:capability:txid:1.0"));
+            let client_hello = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <hello xmlns=\"{NETCONF_BASE_NS}\">\
+                   <capabilities>\
+                     <capability>urn:ietf:params:netconf:base:1.0</capability>\
+                     <capability>urn:ietf:params:netconf:base:1.1</capability>\
+                   </capabilities>\
+                 </hello>"
+            );
+            channel
+                .data(&encode_frame(&client_hello, FramingMode::Base10)[..])
+                .await
+                .unwrap();
+            (session, channel, rx_buf)
+        };
+
+        // === H1: smo applies UNLOCKED with tx-id + traceparent ===
+        let (sess_smo1, mut ch_smo1, mut rx_smo1) = connect_user("smo", "smopass").await;
+        let rpc_edit = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"1\" tx-id=\"wire-tx-h1\" traceparent=\"00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01\">\
+               <edit-config><target><candidate/></target><config>\
+                 <managed-element xmlns=\"urn:demo:o1:nrcelldu\">\
+                   <NRCellDU><id>cell-1</id><attributes><administrativeState>UNLOCKED</administrativeState></attributes></NRCellDU>\
+                 </managed-element>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        let r1 = send_rpc(&mut ch_smo1, &mut rx_smo1, &rpc_edit).await;
+        assert!(r1.contains("tx-id=\"wire-tx-h1\"") && r1.contains("<ok/>"));
+        let rpc_commit = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"2\"><commit/></rpc>"
+        );
+        assert!(send_rpc(&mut ch_smo1, &mut rx_smo1, &rpc_commit).await.contains("<ok/>"));
+        let _ = sess_smo1.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+        // Reconnect as smo: single <get-config><with-provenance/></get-config> proves MINE (H1)
+        let (sess_smo2, mut ch_smo2, mut rx_smo2) = connect_user("smo", "smopass").await;
+        let rpc_get_prov = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"3\">\
+               <get-config><source><running/></source><with-provenance/></get-config>\
+             </rpc>"
+        );
+        let h1_read = send_rpc(&mut ch_smo2, &mut rx_smo2, &rpc_get_prov).await;
+        assert!(h1_read.contains("o1p:owner=\"smo\""));
+        assert!(h1_read.contains("o1p:session-id=\"1\""));
+        assert!(h1_read.contains("o1p:tx-id=\"wire-tx-h1\""));
+        assert!(h1_read.contains("o1p:traceparent=\"00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01\""));
+
+        // === H2: ops2 overwrites running with its own tx-id ===
+        let (sess_ops2, mut ch_ops2, mut rx_ops2) = connect_user("ops2", "ops2pass").await;
+        let rpc_ops2 = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"4\" tx-id=\"wire-tx-h2\">\
+               <edit-config><target><running/></target><config>\
+                 <managed-element xmlns=\"urn:demo:o1:nrcelldu\">\
+                   <NRCellDU><id>cell-1</id><attributes><administrativeState>UNLOCKED</administrativeState></attributes></NRCellDU>\
+                 </managed-element>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        let r2 = send_rpc(&mut ch_ops2, &mut rx_ops2, &rpc_ops2).await;
+        assert!(r2.contains("tx-id=\"wire-tx-h2\"") && r2.contains("<ok/>"));
+        let _ = sess_ops2.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+
+        // Same single <get-config><with-provenance/></get-config> proves NOT_MINE (H2) without replay!
+        let h2_read = send_rpc(&mut ch_smo2, &mut rx_smo2, &rpc_get_prov).await;
+        assert!(h2_read.contains("o1p:owner=\"ops2\""));
+        assert!(h2_read.contains("o1p:session-id=\"3\""));
+        assert!(h2_read.contains("o1p:tx-id=\"wire-tx-h2\""));
+
+        let _ = sess_smo2.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+        srv_task.abort();
+    }
 }

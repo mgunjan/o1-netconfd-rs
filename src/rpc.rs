@@ -1,6 +1,9 @@
 //! RFC 6241 + RFC 5277 XML RPC parser and dispatcher using `quick-xml`.
 
-use crate::datastore::{DatastoreEngine, NetconfError, NotificationRecord, REPLAY_MOD_NS, NOTIF_WRAP_NS};
+use crate::datastore::{
+    xml_escape, DatastoreEngine, NetconfError, NotificationRecord, WriteMeta, NOTIF_WRAP_NS,
+    REPLAY_MOD_NS,
+};
 use chrono::{DateTime, SecondsFormat, Utc};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -24,6 +27,8 @@ pub fn build_server_hello(session_id: u64) -> String {
              <capability>urn:ietf:params:netconf:capability:writable-running:1.0</capability>\
              <capability>urn:ietf:params:netconf:capability:candidate:1.0</capability>\
              <capability>urn:ietf:params:netconf:capability:confirmed-commit:1.1</capability>\
+             <capability>urn:ietf:params:netconf:capability:with-provenance:1.0</capability>\
+             <capability>urn:ietf:params:netconf:capability:txid:1.0</capability>\
              <capability>urn:ietf:params:netconf:capability:notification:1.0</capability>\
              <capability>urn:ietf:params:netconf:capability:interleave:1.0</capability>\
              <capability>urn:ietf:params:xml:ns:yang:ietf-netconf-notifications?module=ietf-netconf-notifications&amp;revision=2012-02-06</capability>\
@@ -54,13 +59,20 @@ pub async fn handle_rpc(
 ) -> RpcOutcome {
     let parsed = parse_rpc(xml);
     let msg_id = parsed.message_id.as_deref().unwrap_or("1");
+    let tx_attr = parsed
+        .tx_id
+        .as_deref()
+        .map(|t| format!(" tx-id=\"{}\"", xml_escape(t)))
+        .unwrap_or_default();
 
     let wrap_ok = || {
-        format!("<rpc-reply xmlns=\"{NETCONF_BASE_NS}\" message-id=\"{msg_id}\"><ok/></rpc-reply>")
+        format!(
+            "<rpc-reply xmlns=\"{NETCONF_BASE_NS}\" message-id=\"{msg_id}\"{tx_attr}><ok/></rpc-reply>"
+        )
     };
     let wrap_err = |err: NetconfError| {
         format!(
-            "<rpc-reply xmlns=\"{NETCONF_BASE_NS}\" message-id=\"{msg_id}\">{}</rpc-reply>",
+            "<rpc-reply xmlns=\"{NETCONF_BASE_NS}\" message-id=\"{msg_id}\"{tx_attr}>{}</rpc-reply>",
             err.to_rpc_error_xml()
         )
     };
@@ -73,10 +85,13 @@ pub async fn handle_rpc(
         },
         Some("get-config") | Some("get") => {
             let src = parsed.source.as_deref().unwrap_or("running");
-            match engine.get_config_xml(src).await {
+            match engine
+                .get_config_xml_with_provenance(src, parsed.with_provenance)
+                .await
+            {
                 Ok(data_inner) => RpcOutcome {
                     reply_xml: format!(
-                        "<rpc-reply xmlns=\"{NETCONF_BASE_NS}\" message-id=\"{msg_id}\"><data>{data_inner}</data></rpc-reply>"
+                        "<rpc-reply xmlns=\"{NETCONF_BASE_NS}\" message-id=\"{msg_id}\"{tx_attr}><data>{data_inner}</data></rpc-reply>"
                     ),
                     close_after: false,
                     subscription: None,
@@ -135,8 +150,12 @@ pub async fn handle_rpc(
                     subscription: None,
                 };
             };
+            let meta = WriteMeta {
+                tx_id: parsed.tx_id.clone(),
+                traceparent: parsed.traceparent.clone(),
+            };
             let reply_xml = match engine
-                .edit_config(target, cell_id, admin_state, username, session_id, source_host)
+                .edit_config_with_meta(target, cell_id, admin_state, username, session_id, source_host, meta)
                 .await
             {
                 Ok(()) => wrap_ok(),
@@ -154,8 +173,12 @@ pub async fn handle_rpc(
                 .as_deref()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(600);
+            let meta = WriteMeta {
+                tx_id: parsed.tx_id.clone(),
+                traceparent: parsed.traceparent.clone(),
+            };
             let reply_xml = match engine
-                .commit(
+                .commit_with_meta(
                     parsed.confirmed,
                     timeout,
                     parsed.persist,
@@ -163,6 +186,7 @@ pub async fn handle_rpc(
                     username,
                     session_id,
                     source_host,
+                    meta,
                 )
                 .await
             {
@@ -226,11 +250,30 @@ struct ParsedRpc {
     persist: Option<String>,
     persist_id: Option<String>,
     start_time: Option<String>,
+    tx_id: Option<String>,
+    traceparent: Option<String>,
+    with_provenance: bool,
 }
 
 fn local_name(raw: &[u8]) -> String {
     let s = String::from_utf8_lossy(raw);
     s.rsplit(':').next().unwrap_or(&s).to_string()
+}
+
+fn extract_meta_attrs(e: &quick_xml::events::BytesStart<'_>, out: &mut ParsedRpc) {
+    for attr in e.attributes().flatten() {
+        let key = local_name(attr.key.as_ref());
+        let val = String::from_utf8_lossy(&attr.value).into_owned();
+        match key.as_str() {
+            "message-id" if local_name(e.name().as_ref()) == "rpc" => out.message_id = Some(val),
+            "tx-id" | "txid" | "etag" => out.tx_id = Some(val),
+            "traceparent" => out.traceparent = Some(val),
+            "with-provenance" | "with-metadata" if val == "true" || val == "1" => {
+                out.with_provenance = true;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_rpc(xml: &str) -> ParsedRpc {
@@ -242,13 +285,10 @@ fn parse_rpc(xml: &str) -> ParsedRpc {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => {
+                extract_meta_attrs(&e, &mut out);
                 let name = local_name(e.name().as_ref());
-                if name == "rpc" {
-                    for attr in e.attributes().flatten() {
-                        if local_name(attr.key.as_ref()) == "message-id" {
-                            out.message_id = Some(String::from_utf8_lossy(&attr.value).into_owned());
-                        }
-                    }
+                if name == "with-provenance" || name == "with-metadata" {
+                    out.with_provenance = true;
                 } else if stack.len() == 1 && stack[0] == "rpc" && out.op.is_none() {
                     out.op = Some(name.clone());
                 } else if stack.last().map(|s| s.as_str()) == Some("source") {
@@ -261,8 +301,11 @@ fn parse_rpc(xml: &str) -> ParsedRpc {
                 stack.push(name);
             }
             Ok(Event::Empty(e)) => {
+                extract_meta_attrs(&e, &mut out);
                 let name = local_name(e.name().as_ref());
-                if stack.len() == 1 && stack[0] == "rpc" && out.op.is_none() {
+                if name == "with-provenance" || name == "with-metadata" {
+                    out.with_provenance = true;
+                } else if stack.len() == 1 && stack[0] == "rpc" && out.op.is_none() {
                     out.op = Some(name);
                 } else if stack.last().map(|s| s.as_str()) == Some("source") {
                     out.source = Some(name);
@@ -284,6 +327,8 @@ fn parse_rpc(xml: &str) -> ParsedRpc {
                     Some("persist") => out.persist = Some(val),
                     Some("persist-id") => out.persist_id = Some(val),
                     Some("startTime") => out.start_time = Some(val),
+                    Some("tx-id") | Some("txid") => out.tx_id = Some(val),
+                    Some("traceparent") => out.traceparent = Some(val),
                     _ => {}
                 }
             }
@@ -499,5 +544,83 @@ mod tests {
         );
         let res_ok = handle_rpc(&owner_confirm, &engine, "smo", sid_smo, None).await;
         assert!(res_ok.reply_xml.contains("<ok/>"));
+    }
+
+    #[tokio::test]
+    async fn rpc_txid_traceparent_and_with_provenance_distinguish_h1_vs_h2() {
+        let dir = tempdir().unwrap();
+        let engine = DatastoreEngine::open(dir.path().join("state.json"), false).unwrap();
+        let sid_smo = engine.allocate_session_id().await.unwrap();
+        let sid_ops2 = engine.allocate_session_id().await.unwrap();
+
+        assert!(build_server_hello(sid_smo).contains("urn:ietf:params:netconf:capability:with-provenance:1.0"));
+        assert!(build_server_hello(sid_smo).contains("urn:ietf:params:netconf:capability:txid:1.0"));
+
+        // H1: smo edits candidate with tx-id + traceparent attributes, commits with child elements
+        let edit_h1 = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"401\" tx-id=\"tx-h1-edit\" traceparent=\"00-11111111111111111111111111111111-2222222222222222-01\">\
+               <edit-config><target><candidate/></target><config>\
+                 <managed-element xmlns=\"urn:demo:o1:nrcelldu\">\
+                   <NRCellDU><id>cell-1</id><attributes><administrativeState>UNLOCKED</administrativeState></attributes></NRCellDU>\
+                 </managed-element>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        let res_edit = handle_rpc(&edit_h1, &engine, "smo", sid_smo, None).await;
+        assert!(res_edit.reply_xml.contains("tx-id=\"tx-h1-edit\""));
+        assert!(res_edit.reply_xml.contains("<ok/>"));
+
+        let commit_h1 = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"402\">\
+               <commit><tx-id>tx-h1-commit</tx-id><confirmed/><persist>p-h1</persist></commit>\
+             </rpc>"
+        );
+        let res_commit = handle_rpc(&commit_h1, &engine, "smo", sid_smo, None).await;
+        assert!(res_commit.reply_xml.contains("tx-id=\"tx-h1-commit\""));
+        assert!(res_commit.reply_xml.contains("<ok/>"));
+
+        // Default <get-config> remains clean without o1p:* attributes
+        let default_get = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"403\"><get-config><source><running/></source></get-config></rpc>"
+        );
+        let res_default = handle_rpc(&default_get, &engine, "smo", sid_smo, None).await;
+        assert!(res_default.reply_xml.contains("<administrativeState>UNLOCKED</administrativeState>"));
+        assert!(!res_default.reply_xml.contains("o1p:"));
+
+        // Single <get-config><with-provenance/></get-config> proves H1 (MINE) without replay
+        let prov_get = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"404\">\
+               <get-config><source><running/></source><with-provenance/></get-config>\
+             </rpc>"
+        );
+        let res_h1 = handle_rpc(&prov_get, &engine, "smo", sid_smo, None).await;
+        assert!(res_h1.reply_xml.contains("xmlns:o1p=\"urn:o1:provenance:1.0\""));
+        assert!(res_h1.reply_xml.contains("o1p:owner=\"smo\""));
+        assert!(res_h1.reply_xml.contains(&format!("o1p:session-id=\"{sid_smo}\"")));
+        assert!(res_h1.reply_xml.contains("o1p:tx-id=\"tx-h1-commit\""));
+        assert!(res_h1.reply_xml.contains("o1p:traceparent=\"00-11111111111111111111111111111111-2222222222222222-01\""));
+
+        // H2: ops2 writes running with its own tx-id -> single <get><with-provenance/></get> shows NOT_MINE
+        let edit_ops2 = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"405\">\
+               <edit-config tx-id=\"tx-h2-ops2\"><target><running/></target><config>\
+                 <managed-element xmlns=\"urn:demo:o1:nrcelldu\">\
+                   <NRCellDU><id>cell-1</id><attributes><administrativeState>UNLOCKED</administrativeState></attributes></NRCellDU>\
+                 </managed-element>\
+               </config></edit-config>\
+             </rpc>"
+        );
+        let res_ops2 = handle_rpc(&edit_ops2, &engine, "ops2", sid_ops2, None).await;
+        assert!(res_ops2.reply_xml.contains("tx-id=\"tx-h2-ops2\""));
+
+        let prov_get_nested = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"406\">\
+               <get><source><running/><with-provenance/></source></get>\
+             </rpc>"
+        );
+        let res_h2 = handle_rpc(&prov_get_nested, &engine, "smo", sid_smo, None).await;
+        assert!(res_h2.reply_xml.contains("o1p:owner=\"ops2\""));
+        assert!(res_h2.reply_xml.contains(&format!("o1p:session-id=\"{sid_ops2}\"")));
+        assert!(res_h2.reply_xml.contains("o1p:tx-id=\"tx-h2-ops2\""));
     }
 }
