@@ -2,7 +2,10 @@
 
 use crate::datastore::DatastoreEngine;
 use crate::framing::{encode_frame, try_decode_frame, FramingMode};
-use crate::rpc::{build_replay_complete_xml, build_server_hello, client_hello_supports_base11, handle_rpc};
+use crate::rpc::{
+    build_replay_complete_xml, build_server_hello, client_hello_supports_base11,
+    handle_rpc_with_subscription_state,
+};
 use anyhow::Result;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Handler, Msg, Server as _, Session};
@@ -10,6 +13,8 @@ use russh::{Channel, ChannelId, CryptoVec};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::broadcast;
+use tokio::task::AbortHandle;
 
 #[derive(Clone)]
 pub struct NetconfSshServer {
@@ -31,6 +36,7 @@ impl russh::server::Server for NetconfSshServer {
             hello_received: false,
             rx_buf: Vec::new(),
             netconf_channel: None,
+            subscription_abort: None,
         }
     }
 }
@@ -45,6 +51,7 @@ pub struct NetconfConnection {
     hello_received: bool,
     rx_buf: Vec<u8>,
     netconf_channel: Option<ChannelId>,
+    subscription_abort: Option<AbortHandle>,
 }
 
 #[async_trait::async_trait]
@@ -124,33 +131,77 @@ impl Handler for NetconfConnection {
                 break;
             };
             let user = self.authenticated_user.as_deref().unwrap_or("unknown");
-            let outcome = handle_rpc(&msg, &self.engine, user, sid, self.peer_ip.clone()).await;
+            let outcome = handle_rpc_with_subscription_state(
+                &msg,
+                &self.engine,
+                user,
+                sid,
+                self.peer_ip.clone(),
+                self.subscription_abort.is_some(),
+            )
+            .await;
 
             let reply_bytes = encode_frame(&outcome.reply_xml, self.framing);
             session.data(channel_id, CryptoVec::from_slice(&reply_bytes))?;
 
-            if let Some((replayed, mut live_rx)) = outcome.subscription {
-                for ev in replayed {
+            if let Some(sub) = outcome.subscription {
+                for ev in sub.replayed {
                     let n_bytes = encode_frame(&ev.to_notification_xml(), self.framing);
                     session.data(channel_id, CryptoVec::from_slice(&n_bytes))?;
                 }
-                let rc_bytes = encode_frame(&build_replay_complete_xml(), self.framing);
-                session.data(channel_id, CryptoVec::from_slice(&rc_bytes))?;
+                if sub.replay_requested {
+                    let rc_bytes = encode_frame(&build_replay_complete_xml(), self.framing);
+                    session.data(channel_id, CryptoVec::from_slice(&rc_bytes))?;
+                }
 
-                // Spawn live notification forwarder using Session::handle()
+                // Spawn live notification forwarder with WAL lag recovery and tracked AbortHandle
                 let handle = session.handle();
                 let mode = self.framing;
-                tokio::spawn(async move {
-                    while let Ok(ev) = live_rx.recv().await {
-                        let bytes = encode_frame(&ev.to_notification_xml(), mode);
-                        if handle.data(channel_id, CryptoVec::from_slice(&bytes)).await.is_err() {
-                            break;
+                let engine = self.engine.clone();
+                let mut live_rx = sub.live_rx;
+                let mut last_sent_seq = sub.watermark_seq;
+                let jh = tokio::spawn(async move {
+                    loop {
+                        match live_rx.recv().await {
+                            Ok(ev) => {
+                                if ev.seq <= last_sent_seq {
+                                    continue;
+                                }
+                                let bytes = encode_frame(&ev.to_notification_xml(), mode);
+                                if handle.data(channel_id, CryptoVec::from_slice(&bytes)).await.is_err() {
+                                    break;
+                                }
+                                last_sent_seq = ev.seq;
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(
+                                    skipped,
+                                    last_sent_seq,
+                                    "NETCONF subscription receiver lagged; recovering missed records from WAL"
+                                );
+                                let missed = engine.notifications_after_seq(last_sent_seq).await;
+                                for ev in missed {
+                                    if ev.seq <= last_sent_seq {
+                                        continue;
+                                    }
+                                    let bytes = encode_frame(&ev.to_notification_xml(), mode);
+                                    if handle.data(channel_id, CryptoVec::from_slice(&bytes)).await.is_err() {
+                                        return;
+                                    }
+                                    last_sent_seq = ev.seq;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 });
+                self.subscription_abort = Some(jh.abort_handle());
             }
 
             if outcome.close_after {
+                if let Some(abort) = self.subscription_abort.take() {
+                    abort.abort();
+                }
                 if let Some(sid) = self.session_id.take() {
                     let _ = self.engine.on_session_closed(sid).await;
                 }
@@ -167,6 +218,9 @@ impl Handler for NetconfConnection {
         _channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if let Some(abort) = self.subscription_abort.take() {
+            abort.abort();
+        }
         if let Some(sid) = self.session_id.take() {
             let _ = self.engine.on_session_closed(sid).await;
         }
@@ -184,6 +238,9 @@ impl Handler for NetconfConnection {
 
 impl Drop for NetconfConnection {
     fn drop(&mut self) {
+        if let Some(abort) = self.subscription_abort.take() {
+            abort.abort();
+        }
         if let Some(sid) = self.session_id.take() {
             let eng = self.engine.clone();
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
@@ -679,5 +736,113 @@ mod tests {
 
         let _ = sess_check.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
         srv_task2.abort();
+    }
+
+    #[tokio::test]
+    async fn ssh_subscription_lag_recovers_from_wal_and_gates_replay_complete_on_start_time() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        // Tiny broadcast capacity (2) so an 8-write burst deterministically triggers RecvError::Lagged
+        let engine = DatastoreEngine::open_with_capacity(&state_path, false, 2).unwrap();
+
+        let mut users = HashMap::new();
+        users.insert("smo".to_string(), "smopass".to_string());
+        users.insert("ops2".to_string(), "ops2pass".to_string());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = Arc::new(build_server_config().unwrap());
+        let mut srv = NetconfSshServer {
+            engine: engine.clone(),
+            users: Arc::new(users),
+        };
+        let srv_task = tokio::spawn(async move {
+            let _ = srv.run_on_socket(config, &listener).await;
+        });
+
+        let connect_session = |user: &'static str, pass: &'static str| async move {
+            let mut session = timeout(
+                Duration::from_secs(5),
+                russh::client::connect(Arc::new(russh::client::Config::default()), addr, TestClient),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(session.authenticate_password(user, pass).await.unwrap());
+            let mut channel = session.channel_open_session().await.unwrap();
+            channel.request_subsystem(true, "netconf").await.unwrap();
+            let mut rx_buf = Vec::new();
+            let _hello = read_netconf_frame(&mut channel, &mut rx_buf, FramingMode::Base10).await;
+            let client_hello = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <hello xmlns=\"{NETCONF_BASE_NS}\">\
+                   <capabilities>\
+                     <capability>urn:ietf:params:netconf:base:1.0</capability>\
+                     <capability>urn:ietf:params:netconf:base:1.1</capability>\
+                   </capabilities>\
+                 </hello>"
+            );
+            channel
+                .data(&encode_frame(&client_hello, FramingMode::Base10)[..])
+                .await
+                .unwrap();
+            (session, channel, rx_buf)
+        };
+
+        let (sess_sub, mut ch_sub, mut rx_sub) = connect_session("smo", "smopass").await;
+        let (sess_wr, mut ch_wr, mut rx_wr) = connect_session("ops2", "ops2pass").await;
+
+        // Subscribe WITHOUT <startTime>: RFC 5277 §3.3.3 requires NO <replayComplete/>
+        let live_only_sub = format!(
+            "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"1\">\
+               <create-subscription xmlns=\"urn:ietf:params:xml:ns:netconf:notification:1.0\">\
+                 <stream>NETCONF</stream>\
+               </create-subscription>\
+             </rpc>"
+        );
+        let sub_reply = send_rpc(&mut ch_sub, &mut rx_sub, &live_only_sub).await;
+        assert!(sub_reply.contains("<ok/>"));
+
+        // Duplicate <create-subscription> on the same session must be rejected with operation-failed
+        let dup_reply = send_rpc(&mut ch_sub, &mut rx_sub, &live_only_sub).await;
+        assert!(dup_reply.contains("<error-tag>operation-failed</error-tag>"));
+
+        // Burst 8 alternating running edits while subscriber is not draining its SSH channel yet
+        let states = [
+            "UNLOCKED", "LOCKED", "UNLOCKED", "LOCKED",
+            "UNLOCKED", "LOCKED", "UNLOCKED", "LOCKED",
+        ];
+        for (idx, st) in states.iter().enumerate() {
+            let edit_rpc = format!(
+                "<rpc xmlns=\"{NETCONF_BASE_NS}\" message-id=\"{}\" tx-id=\"lag-seq-{}\">\
+                   <edit-config><target><running/></target><config>\
+                     <managed-element xmlns=\"urn:demo:o1:nrcelldu\">\
+                       <NRCellDU><id>cell-1</id><attributes><administrativeState>{st}</administrativeState></attributes></NRCellDU>\
+                     </managed-element>\
+                   </config></edit-config>\
+                 </rpc>",
+                10 + idx,
+                idx + 1
+            );
+            let r = send_rpc(&mut ch_wr, &mut rx_wr, &edit_rpc).await;
+            assert!(r.contains("<ok/>"));
+        }
+
+        // Subscriber must recover all 8 notifications in exact order from WAL with zero <replayComplete/>
+        for idx in 1..=8 {
+            let notif = read_netconf_frame(&mut ch_sub, &mut rx_sub, FramingMode::Base11).await;
+            assert!(
+                !notif.contains("<replayComplete"),
+                "live-only subscription must not emit <replayComplete/>"
+            );
+            assert!(
+                notif.contains(&format!("<tx-id>lag-seq-{idx}</tx-id>")),
+                "expected gapless notification {idx}, got: {notif}"
+            );
+        }
+
+        let _ = sess_sub.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+        let _ = sess_wr.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+        srv_task.abort();
     }
 }

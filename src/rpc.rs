@@ -11,10 +11,17 @@ use tokio::sync::broadcast;
 
 pub const NETCONF_BASE_NS: &str = "urn:ietf:params:xml:ns:netconf:base:1.0";
 
+pub struct SubscriptionInit {
+    pub replayed: Vec<NotificationRecord>,
+    pub watermark_seq: u64,
+    pub replay_requested: bool,
+    pub live_rx: broadcast::Receiver<NotificationRecord>,
+}
+
 pub struct RpcOutcome {
     pub reply_xml: String,
     pub close_after: bool,
-    pub subscription: Option<(Vec<NotificationRecord>, broadcast::Receiver<NotificationRecord>)>,
+    pub subscription: Option<SubscriptionInit>,
 }
 
 pub fn build_server_hello(session_id: u64) -> String {
@@ -57,6 +64,17 @@ pub async fn handle_rpc(
     username: &str,
     session_id: u64,
     source_host: Option<String>,
+) -> RpcOutcome {
+    handle_rpc_with_subscription_state(xml, engine, username, session_id, source_host, false).await
+}
+
+pub async fn handle_rpc_with_subscription_state(
+    xml: &str,
+    engine: &DatastoreEngine,
+    username: &str,
+    session_id: u64,
+    source_host: Option<String>,
+    subscription_active: bool,
 ) -> RpcOutcome {
     let parsed = parse_rpc(xml);
     let msg_id = parsed.message_id.as_deref().unwrap_or("1");
@@ -225,16 +243,43 @@ pub async fn handle_rpc(
             }
         }
         Some("create-subscription") => {
-            let start_dt = parsed
-                .start_time
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&Utc));
-            let sub = engine.replay_and_subscribe(start_dt).await;
+            if subscription_active {
+                return RpcOutcome {
+                    reply_xml: wrap_err(NetconfError::operation_failed(
+                        "A NETCONF event subscription is already active on this session",
+                    )),
+                    close_after: false,
+                    subscription: None,
+                };
+            }
+            let replay_requested = parsed.start_time.is_some();
+            let start_dt = if let Some(ref raw_ts) = parsed.start_time {
+                match DateTime::parse_from_rfc3339(raw_ts) {
+                    Ok(dt) => Some(dt.with_timezone(&Utc)),
+                    Err(_) => {
+                        return RpcOutcome {
+                            reply_xml: wrap_err(NetconfError::invalid_value(format!(
+                                "Invalid RFC 3339 startTime in create-subscription: {raw_ts}"
+                            ))),
+                            close_after: false,
+                            subscription: None,
+                        };
+                    }
+                }
+            } else {
+                None
+            };
+            let (replayed, watermark_seq, live_rx) =
+                engine.replay_and_subscribe_with_watermark(start_dt).await;
             RpcOutcome {
                 reply_xml: wrap_ok(),
                 close_after: false,
-                subscription: Some(sub),
+                subscription: Some(SubscriptionInit {
+                    replayed,
+                    watermark_seq,
+                    replay_requested,
+                    live_rx,
+                }),
             }
         }
         Some("verify-provenance-chain") => {
@@ -576,8 +621,10 @@ mod tests {
         assert!(res.reply_xml.contains("message-id=\"108\""));
         assert!(res.reply_xml.contains("<ok/>"));
 
-        let (replayed, mut live_rx) = res.subscription.expect("subscription should be established");
-        let xmls: Vec<String> = replayed.iter().map(|n| n.to_notification_xml()).collect();
+        let sub = res.subscription.expect("subscription should be established");
+        assert!(sub.replay_requested);
+        let mut live_rx = sub.live_rx;
+        let xmls: Vec<String> = sub.replayed.iter().map(|n| n.to_notification_xml()).collect();
         assert_eq!(xmls.len(), 3);
         assert!(xmls[0].contains("<netconf-config-change xmlns=\"urn:ietf:params:xml:ns:yang:ietf-netconf-notifications\">"));
         assert!(xmls[0].contains(&format!("<changed-by><username>smo</username><session-id>{sid}</session-id><source-host>127.0.0.1</source-host></changed-by>")));
