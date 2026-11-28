@@ -1,0 +1,19 @@
+name: Rust Unit & Wire Integration CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test --locked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit, persistence-boundary, fault-proxy, and SSH wire tests
+        run: cargo test --locked -- --nocapture
+      - name: Build release binary cleanly
+        run: cargo build --release --locked

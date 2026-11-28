@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
@@ -22,6 +23,27 @@ pub const RFC6470_NS: &str = "urn:ietf:params:xml:ns:yang:ietf-netconf-notificat
 pub const GENESIS_HASH: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 const AUDIT_WAL_TABLE: TableDefinition<u64, &str> = TableDefinition::new("audit_wal");
+const STATE_META_TABLE: TableDefinition<&str, &str> = TableDefinition::new("state_meta");
+const STATE_META_KEY: &str = "persisted_store";
+
+/// Deterministic failure-injection modes for testing the authoritative persistence boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FailPersistMode {
+    None = 0,
+    FailSnapshot = 1,
+    FailRedb = 2,
+}
+
+impl FailPersistMode {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::FailSnapshot,
+            2 => Self::FailRedb,
+            _ => Self::None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct NetconfError {
@@ -340,6 +362,8 @@ pub enum PendingCommitState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedStore {
+    #[serde(default)]
+    pub commit_seq: u64,
     pub next_session_id: u64,
     pub running_cells: BTreeMap<String, String>,
     #[serde(default)]
@@ -357,6 +381,7 @@ impl Default for PersistedStore {
         let mut running_cells = BTreeMap::new();
         running_cells.insert("cell-1".to_string(), "LOCKED".to_string());
         Self {
+            commit_seq: 0,
             next_session_id: 1,
             running_cells,
             running_du_ext: BTreeMap::new(),
@@ -368,13 +393,35 @@ impl Default for PersistedStore {
     }
 }
 
-struct InnerState {
+#[derive(Clone)]
+struct DatastoreSnapshot {
     persisted: PersistedStore,
     candidate_cells: BTreeMap<String, String>,
     candidate_du_ext: BTreeMap<String, ManagedAttributes>,
     candidate_cu_objects: BTreeMap<String, CuObjectRecord>,
     candidate_provenance: BTreeMap<String, LeafProvenance>,
     candidate_dirty: std::collections::BTreeSet<String>,
+}
+
+impl DatastoreSnapshot {
+    fn from_persisted(persisted: PersistedStore) -> Self {
+        let candidate_cells = persisted.running_cells.clone();
+        let candidate_du_ext = persisted.running_du_ext.clone();
+        let candidate_cu_objects = persisted.running_cu_objects.clone();
+        let candidate_provenance = persisted.running_provenance.clone();
+        Self {
+            persisted,
+            candidate_cells,
+            candidate_du_ext,
+            candidate_cu_objects,
+            candidate_provenance,
+            candidate_dirty: std::collections::BTreeSet::new(),
+        }
+    }
+}
+
+struct InnerState {
+    snapshot: DatastoreSnapshot,
     candidate_lock: Option<u64>,
     running_lock: Option<u64>,
 }
@@ -387,13 +434,32 @@ pub struct DatastoreEngine {
     wal_db: Arc<std::sync::Mutex<Database>>,
     notif_tx: broadcast::Sender<NotificationRecord>,
     startup_events: Arc<Vec<NotificationRecord>>,
+    fail_next_persist: Arc<AtomicU8>,
 }
 
 impl DatastoreEngine {
-    /// Open or initialize the crash-safe datastore at `state_path`.
-    /// On startup, any unconfirmed commit from before a crash/restart is atomically rolled back
-    /// AND its `PendingCommitState` is reset to `Idle`, emitting `<changed-by><server/></changed-by>`.
+    /// Open or initialize the crash-safe datastore at `state_path` with default broadcast capacity (256).
+    ///
+    /// Authoritative commit boundary:
+    ///   1. Temp JSON snapshot (`state.json.tmp`) is written and synced (`fsync`).
+    ///   2. `state.redb` commits both `state_meta` (`PersistedStore`) and `audit_wal` (`NotificationRecord`s)
+    ///      in a single ACID transaction.
+    ///   3. `state.json.tmp` is atomically renamed over `state.json` and the parent directory is synced.
+    ///   4. Only after durability succeeds are in-memory state swapped and live notifications broadcast.
+    ///
+    /// On startup, if `state.redb` contains a valid committed `state_meta` snapshot newer than `state.json`
+    /// (`redb.commit_seq > json.commit_seq`), recovery restores from `state.redb` and re-syncs `state.json`.
+    /// Any pending unconfirmed commit from before a crash/restart is atomically rolled back to `Idle`.
     pub fn open(state_path: impl AsRef<Path>, strict_persist_owner: bool) -> Result<Self> {
+        Self::open_with_capacity(state_path, strict_persist_owner, 256)
+    }
+
+    /// Open or initialize the datastore with an explicit broadcast channel capacity (useful for lag testing).
+    pub fn open_with_capacity(
+        state_path: impl AsRef<Path>,
+        strict_persist_owner: bool,
+        notif_capacity: usize,
+    ) -> Result<Self> {
         let state_path = state_path.as_ref().to_path_buf();
         let wal_path = state_path.with_extension("redb");
         if let Some(parent) = state_path.parent() {
@@ -422,6 +488,27 @@ impl DatastoreEngine {
         }
 
         let initial_chain_valid = verify_notifications_chain(&persisted.notifications).valid;
+        let wal_db = Database::create(&wal_path)?;
+
+        // Reconcile if crash happened after redb commit but before state.json rename
+        if initial_chain_valid {
+            if let Ok(read_txn) = wal_db.begin_read() {
+                if let Ok(meta_table) = read_txn.open_table(STATE_META_TABLE) {
+                    if let Ok(Some(meta_val)) = meta_table.get(STATE_META_KEY) {
+                        if let Ok(redb_store) =
+                            serde_json::from_str::<PersistedStore>(meta_val.value())
+                        {
+                            if redb_store.commit_seq > persisted.commit_seq
+                                && verify_notifications_chain(&redb_store.notifications).valid
+                            {
+                                persisted = redb_store;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let pre_recovery_len = persisted.notifications.len();
 
         // Crash / restart recovery: atomic rollback + PendingCommitState::Idle clearing
@@ -489,57 +576,60 @@ impl DatastoreEngine {
                     },
                 );
             }
+            persisted.commit_seq = persisted.commit_seq.saturating_add(1);
         }
 
-        atomic_write_json(&state_path, &persisted)?;
-
-        let wal_db = Database::create(&wal_path)?;
+        // Write authoritative redb tables + synchronized JSON mirror atomically on open
         {
             let write_txn = wal_db.begin_write()?;
             {
-                let mut table = write_txn.open_table(AUDIT_WAL_TABLE)?;
+                let mut meta_table = write_txn.open_table(STATE_META_TABLE)?;
+                if initial_chain_valid || meta_table.get(STATE_META_KEY)?.is_none() {
+                    let encoded_store = serde_json::to_string(&persisted)?;
+                    meta_table.insert(STATE_META_KEY, encoded_store.as_str())?;
+                }
+                let mut wal_table = write_txn.open_table(AUDIT_WAL_TABLE)?;
                 if initial_chain_valid {
                     for rec in &persisted.notifications {
-                        if table.get(rec.seq)?.is_none() {
+                        if wal_table.get(rec.seq)?.is_none() {
                             let encoded = serde_json::to_string(rec)?;
-                            table.insert(rec.seq, encoded.as_str())?;
+                            wal_table.insert(rec.seq, encoded.as_str())?;
                         }
                     }
                 } else if persisted.notifications.len() > pre_recovery_len {
                     for rec in &persisted.notifications[pre_recovery_len..] {
                         let encoded = serde_json::to_string(rec)?;
-                        table.insert(rec.seq, encoded.as_str())?;
+                        wal_table.insert(rec.seq, encoded.as_str())?;
                     }
                 }
             }
             write_txn.commit()?;
         }
+        atomic_write_json(&state_path, &persisted)?;
 
         let startup_events = Arc::new(persisted.notifications[pre_recovery_len..].to_vec());
-        let candidate_cells = persisted.running_cells.clone();
-        let candidate_du_ext = persisted.running_du_ext.clone();
-        let candidate_cu_objects = persisted.running_cu_objects.clone();
-        let candidate_provenance = persisted.running_provenance.clone();
-        let (notif_tx, _) = broadcast::channel(256);
+        let snapshot = DatastoreSnapshot::from_persisted(persisted);
+        let (notif_tx, _) = broadcast::channel(notif_capacity.max(1));
         let engine = Self {
             state_path,
             strict_persist_owner,
             inner: Arc::new(Mutex::new(InnerState {
-                persisted,
-                candidate_cells,
-                candidate_du_ext,
-                candidate_cu_objects,
-                candidate_provenance,
-                candidate_dirty: std::collections::BTreeSet::new(),
+                snapshot,
                 candidate_lock: None,
                 running_lock: None,
             })),
             wal_db: Arc::new(std::sync::Mutex::new(wal_db)),
             notif_tx,
             startup_events,
+            fail_next_persist: Arc::new(AtomicU8::new(FailPersistMode::None as u8)),
         };
 
         Ok(engine)
+    }
+
+    /// Arm a one-shot persistence failure injection on the next durable write (for tests).
+    pub fn set_fail_next_persist(&self, mode: FailPersistMode) {
+        self.fail_next_persist.store(mode as u8, Ordering::Release);
     }
 
     /// Spawn a background async VES 7.x `notifyMOIChanges` HTTP JSON emitter for every
@@ -572,22 +662,74 @@ impl DatastoreEngine {
         }))
     }
 
-    fn persist_with_wal(&self, persisted: &PersistedStore, prev_len: usize) -> Result<()> {
-        atomic_write_json(&self.state_path, persisted)?;
-        if persisted.notifications.len() > prev_len {
-            let db = self
-                .wal_db
-                .lock()
-                .map_err(|_| anyhow::anyhow!("WAL database lock poisoned"))?;
-            let write_txn = db.begin_write()?;
-            {
-                let mut table = write_txn.open_table(AUDIT_WAL_TABLE)?;
+    fn persist_with_wal(&self, persisted: &mut PersistedStore, prev_len: usize) -> Result<()> {
+        let mode = FailPersistMode::from_u8(self.fail_next_persist.swap(0, Ordering::AcqRel));
+        persisted.commit_seq = persisted.commit_seq.saturating_add(1);
+
+        let tmp = self.state_path.with_extension("json.tmp");
+        let data = serde_json::to_vec_pretty(persisted)?;
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&data)?;
+            f.sync_all()?;
+        }
+        if mode == FailPersistMode::FailSnapshot {
+            let _ = fs::remove_file(&tmp);
+            anyhow::bail!("Injected snapshot persistence failure");
+        }
+
+        let db = self
+            .wal_db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("WAL database lock poisoned"))?;
+        let state_json = serde_json::to_string(persisted)?;
+        let write_txn = db.begin_write()?;
+        {
+            let mut meta_table = write_txn.open_table(STATE_META_TABLE)?;
+            meta_table.insert(STATE_META_KEY, state_json.as_str())?;
+            let mut wal_table = write_txn.open_table(AUDIT_WAL_TABLE)?;
+            if persisted.notifications.len() > prev_len {
                 for rec in &persisted.notifications[prev_len..] {
                     let encoded = serde_json::to_string(rec)?;
-                    table.insert(rec.seq, encoded.as_str())?;
+                    wal_table.insert(rec.seq, encoded.as_str())?;
                 }
             }
-            write_txn.commit()?;
+        }
+        if mode == FailPersistMode::FailRedb {
+            drop(write_txn);
+            let _ = fs::remove_file(&tmp);
+            anyhow::bail!("Injected redb ACID commit failure");
+        }
+        // AUTHORITATIVE COMMIT POINT: once the single redb ACID transaction commits, the change
+        // (state_meta snapshot + audit WAL entries) is durable and will be recovered by `open()`.
+        write_txn.commit()?;
+
+        // The JSON file is a synchronized mirror. A mirror failure after the redb commit must not
+        // report the change as failed (it is durable); `open()` reconciles via `commit_seq`.
+        match fs::rename(&tmp, &self.state_path) {
+            Ok(()) => {
+                if let Err(err) = sync_parent_dir(&self.state_path) {
+                    tracing::warn!(error = %err, "parent dir sync failed after durable redb commit");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "state.json mirror rename failed after durable redb commit; will reconcile on open");
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_staged(
+        &self,
+        guard: &mut InnerState,
+        mut staged: DatastoreSnapshot,
+        prev_len: usize,
+    ) -> Result<()> {
+        self.persist_with_wal(&mut staged.persisted, prev_len)?;
+        let new_events = staged.persisted.notifications[prev_len..].to_vec();
+        guard.snapshot = staged;
+        for ev in new_events {
+            let _ = self.notif_tx.send(ev);
         }
         Ok(())
     }
@@ -595,20 +737,20 @@ impl DatastoreEngine {
     /// Verify integrity of the SHA-256 hash-chained audit WAL and `redb` ACID store.
     pub async fn verify_audit_chain(&self) -> AuditChainReport {
         let guard = self.inner.lock().await;
-        let report = verify_notifications_chain(&guard.persisted.notifications);
+        let report = verify_notifications_chain(&guard.snapshot.persisted.notifications);
         if !report.valid {
             return report;
         }
         let Ok(db) = self.wal_db.lock() else {
             return AuditChainReport {
                 valid: false,
-                entries: guard.persisted.notifications.len(),
+                entries: guard.snapshot.persisted.notifications.len(),
                 head_hash: report.head_hash,
                 tampered_seq: Some(1),
                 reason: Some("WAL database lock poisoned".to_string()),
             };
         };
-        cross_check_redb(&db, &guard.persisted.notifications, report)
+        cross_check_redb(&db, &guard.snapshot.persisted.notifications, report)
     }
 
     pub fn spawn_timeout_watcher(&self) {
@@ -634,73 +776,25 @@ impl DatastoreEngine {
             owner_user,
             owner_session_id,
             ..
-        } = guard.persisted.pending_commit.clone()
+        } = guard.snapshot.persisted.pending_commit.clone()
         {
             if now_ms >= deadline_ms {
-                let prev_len = guard.persisted.notifications.len();
-                let changed_leaves = diff_changed_leaves(
-                    &guard.persisted.running_cells,
-                    &guard.persisted.running_du_ext,
-                    &guard.persisted.running_cu_objects,
-                    &rollback_cells,
-                    &rollback_du_ext,
-                    &rollback_cu_objects,
+                let prev_len = guard.snapshot.persisted.notifications.len();
+                let mut staged = guard.snapshot.clone();
+                apply_rollback_snapshot(
+                    &mut staged,
+                    rollback_cells,
+                    rollback_du_ext,
+                    rollback_cu_objects,
+                    rollback_provenance,
+                    "timeout",
+                    &owner_user,
+                    owner_session_id,
+                    ChangedBy::Server,
+                    WriterOrigin::ServerRollback,
+                    true,
                 );
-                let now = Utc::now();
-                guard.persisted.running_cells = rollback_cells.clone();
-                guard.persisted.running_du_ext = rollback_du_ext.clone();
-                guard.persisted.running_cu_objects = rollback_cu_objects.clone();
-                guard.persisted.running_provenance = rollback_provenance.clone();
-                for (prov_key, _) in &changed_leaves {
-                    guard
-                        .persisted
-                        .running_provenance
-                        .entry(prov_key.clone())
-                        .or_insert_with(|| LeafProvenance {
-                            owner_principal: "server".to_string(),
-                            owner_session_id: 0,
-                            writer_origin: WriterOrigin::ServerRollback,
-                            tx_id: None,
-                            traceparent: None,
-                            updated_at: now,
-                        });
-                }
-                guard.candidate_cells = rollback_cells;
-                guard.candidate_du_ext = rollback_du_ext;
-                guard.candidate_cu_objects = rollback_cu_objects;
-                guard.candidate_provenance = guard.persisted.running_provenance.clone();
-                guard.candidate_dirty.clear();
-                guard.persisted.pending_commit = PendingCommitState::Idle;
-
-                let ev1 = append_notification(
-                    &mut guard.persisted,
-                    now,
-                    NotificationPayload::ConfirmedCommit {
-                        confirm_event: "timeout".to_string(),
-                        username: Some(owner_user),
-                        session_id: Some(owner_session_id),
-                    },
-                );
-                let _ = self.notif_tx.send(ev1);
-
-                if !changed_leaves.is_empty() {
-                    let changed_targets: Vec<String> =
-                        changed_leaves.into_iter().map(|(_, p)| p).collect();
-                    let ev2 = append_notification(
-                        &mut guard.persisted,
-                        now,
-                        NotificationPayload::ConfigChange {
-                            changed_by: ChangedBy::Server,
-                            datastore: "running".to_string(),
-                            targets: changed_targets,
-                            writer_origin: WriterOrigin::ServerRollback,
-                            tx_id: None,
-                            traceparent: None,
-                        },
-                    );
-                    let _ = self.notif_tx.send(ev2);
-                }
-                self.persist_with_wal(&guard.persisted, prev_len)?;
+                self.commit_staged(&mut guard, staged, prev_len)?;
             }
         }
         Ok(())
@@ -709,9 +803,11 @@ impl DatastoreEngine {
     /// Allocate a strictly monotonic, crash-persisted NETCONF session ID (RFC 6470 non-zero).
     pub async fn allocate_session_id(&self) -> Result<u64> {
         let mut guard = self.inner.lock().await;
-        let sid = guard.persisted.next_session_id.max(1);
-        guard.persisted.next_session_id = sid + 1;
-        atomic_write_json(&self.state_path, &guard.persisted)?;
+        let prev_len = guard.snapshot.persisted.notifications.len();
+        let mut staged = guard.snapshot.clone();
+        let sid = staged.persisted.next_session_id.max(1);
+        staged.persisted.next_session_id = sid + 1;
+        self.commit_staged(&mut guard, staged, prev_len)?;
         Ok(sid)
     }
 
@@ -733,71 +829,25 @@ impl DatastoreEngine {
             rollback_provenance,
             owner_user,
             ..
-        } = guard.persisted.pending_commit.clone()
+        } = guard.snapshot.persisted.pending_commit.clone()
         {
             if owner_session_id == session_id {
-                let prev_len = guard.persisted.notifications.len();
-                let changed_leaves = diff_changed_leaves(
-                    &guard.persisted.running_cells,
-                    &guard.persisted.running_du_ext,
-                    &guard.persisted.running_cu_objects,
-                    &rollback_cells,
-                    &rollback_du_ext,
-                    &rollback_cu_objects,
+                let prev_len = guard.snapshot.persisted.notifications.len();
+                let mut staged = guard.snapshot.clone();
+                apply_rollback_snapshot(
+                    &mut staged,
+                    rollback_cells,
+                    rollback_du_ext,
+                    rollback_cu_objects,
+                    rollback_provenance,
+                    "cancel",
+                    &owner_user,
+                    session_id,
+                    ChangedBy::Server,
+                    WriterOrigin::ServerRollback,
+                    true,
                 );
-                let now = Utc::now();
-                guard.persisted.running_cells = rollback_cells.clone();
-                guard.persisted.running_du_ext = rollback_du_ext.clone();
-                guard.persisted.running_cu_objects = rollback_cu_objects.clone();
-                guard.persisted.running_provenance = rollback_provenance.clone();
-                for (prov_key, _) in &changed_leaves {
-                    guard
-                        .persisted
-                        .running_provenance
-                        .entry(prov_key.clone())
-                        .or_insert_with(|| LeafProvenance {
-                            owner_principal: "server".to_string(),
-                            owner_session_id: 0,
-                            writer_origin: WriterOrigin::ServerRollback,
-                            tx_id: None,
-                            traceparent: None,
-                            updated_at: now,
-                        });
-                }
-                guard.candidate_cells = rollback_cells;
-                guard.candidate_du_ext = rollback_du_ext;
-                guard.candidate_cu_objects = rollback_cu_objects;
-                guard.candidate_provenance = guard.persisted.running_provenance.clone();
-                guard.candidate_dirty.clear();
-                guard.persisted.pending_commit = PendingCommitState::Idle;
-                let ev1 = append_notification(
-                    &mut guard.persisted,
-                    now,
-                    NotificationPayload::ConfirmedCommit {
-                        confirm_event: "cancel".to_string(),
-                        username: Some(owner_user),
-                        session_id: Some(session_id),
-                    },
-                );
-                let _ = self.notif_tx.send(ev1);
-                if !changed_leaves.is_empty() {
-                    let changed_targets: Vec<String> =
-                        changed_leaves.into_iter().map(|(_, p)| p).collect();
-                    let ev2 = append_notification(
-                        &mut guard.persisted,
-                        now,
-                        NotificationPayload::ConfigChange {
-                            changed_by: ChangedBy::Server,
-                            datastore: "running".to_string(),
-                            targets: changed_targets,
-                            writer_origin: WriterOrigin::ServerRollback,
-                            tx_id: None,
-                            traceparent: None,
-                        },
-                    );
-                    let _ = self.notif_tx.send(ev2);
-                }
-                self.persist_with_wal(&guard.persisted, prev_len)?;
+                self.commit_staged(&mut guard, staged, prev_len)?;
             }
         }
         Ok(())
@@ -813,18 +863,19 @@ impl DatastoreEngine {
         with_provenance: bool,
     ) -> Result<String, NetconfError> {
         let guard = self.inner.lock().await;
+        let snap = &guard.snapshot;
         let (du, du_ext, cu, prov) = match source {
             "running" => (
-                &guard.persisted.running_cells,
-                &guard.persisted.running_du_ext,
-                &guard.persisted.running_cu_objects,
-                &guard.persisted.running_provenance,
+                &snap.persisted.running_cells,
+                &snap.persisted.running_du_ext,
+                &snap.persisted.running_cu_objects,
+                &snap.persisted.running_provenance,
             ),
             "candidate" => (
-                &guard.candidate_cells,
-                &guard.candidate_du_ext,
-                &guard.candidate_cu_objects,
-                &guard.candidate_provenance,
+                &snap.candidate_cells,
+                &snap.candidate_du_ext,
+                &snap.candidate_cu_objects,
+                &snap.candidate_provenance,
             ),
             other => return Err(NetconfError::invalid_value(format!("Unsupported datastore: {other}"))),
         };
@@ -877,11 +928,8 @@ impl DatastoreEngine {
                 return Err(NetconfError::lock_denied("Candidate datastore is locked"));
             }
         }
-        guard.candidate_cells = guard.persisted.running_cells.clone();
-        guard.candidate_du_ext = guard.persisted.running_du_ext.clone();
-        guard.candidate_cu_objects = guard.persisted.running_cu_objects.clone();
-        guard.candidate_provenance = guard.persisted.running_provenance.clone();
-        guard.candidate_dirty.clear();
+        let persisted = guard.snapshot.persisted.clone();
+        guard.snapshot = DatastoreSnapshot::from_persisted(persisted);
         Ok(())
     }
 
@@ -964,7 +1012,7 @@ impl DatastoreEngine {
                         return Err(NetconfError::lock_denied("Candidate datastore is locked"));
                     }
                 }
-                apply_edits_to_candidate(&mut guard, edits, &prov);
+                apply_edits_to_candidate(&mut guard.snapshot, edits, &prov);
                 Ok(())
             }
             "running" => {
@@ -973,8 +1021,9 @@ impl DatastoreEngine {
                         return Err(NetconfError::lock_denied("Running datastore is locked"));
                     }
                 }
-                let prev_len = guard.persisted.notifications.len();
-                let changed_targets = apply_edits_to_running(&mut guard, edits, &prov);
+                let prev_len = guard.snapshot.persisted.notifications.len();
+                let mut staged = guard.snapshot.clone();
+                let changed_targets = apply_edits_to_running(&mut staged, edits, &prov);
                 if !changed_targets.is_empty() {
                     let changed_by = if session_id == 0 {
                         ChangedBy::Server
@@ -985,8 +1034,8 @@ impl DatastoreEngine {
                             source_host,
                         }
                     };
-                    let ev = append_notification(
-                        &mut guard.persisted,
+                    append_notification(
+                        &mut staged.persisted,
                         now,
                         NotificationPayload::ConfigChange {
                             changed_by,
@@ -997,9 +1046,8 @@ impl DatastoreEngine {
                             traceparent: meta.traceparent,
                         },
                     );
-                    let _ = self.notif_tx.send(ev);
                 }
-                self.persist_with_wal(&guard.persisted, prev_len)
+                self.commit_staged(&mut guard, staged, prev_len)
                     .map_err(|e| NetconfError::operation_failed(e.to_string()))?;
                 Ok(())
             }
@@ -1061,8 +1109,8 @@ impl DatastoreEngine {
 
         // Case 1: Confirming / extending commit carrying <persist-id> (RFC 6241 §8.4.5.1 strict check!)
         if let Some(ref req_pid) = persist_id {
-            let prev_len = guard.persisted.notifications.len();
-            match &guard.persisted.pending_commit {
+            let prev_len = guard.snapshot.persisted.notifications.len();
+            match &guard.snapshot.persisted.pending_commit {
                 PendingCommitState::Idle => {
                     return Err(NetconfError::invalid_value(
                         "Confirming commit does not match any pending confirmed commit",
@@ -1086,8 +1134,8 @@ impl DatastoreEngine {
                 }
             }
 
+            let mut staged = guard.snapshot.clone();
             if confirmed {
-                // Extending timeout on an active persistent confirmed commit
                 if let PendingCommitState::Pending {
                     rollback_cells,
                     rollback_du_ext,
@@ -1096,11 +1144,11 @@ impl DatastoreEngine {
                     owner_user,
                     owner_session_id,
                     ..
-                } = guard.persisted.pending_commit.clone()
+                } = staged.persisted.pending_commit.clone()
                 {
                     let new_pid = persist.or_else(|| Some(req_pid.clone()));
                     let deadline_ms = Utc::now().timestamp_millis() + (timeout_secs as i64 * 1000);
-                    guard.persisted.pending_commit = PendingCommitState::Pending {
+                    staged.persisted.pending_commit = PendingCommitState::Pending {
                         persist_id: new_pid,
                         owner_user,
                         owner_session_id,
@@ -1110,8 +1158,8 @@ impl DatastoreEngine {
                         rollback_cu_objects,
                         rollback_provenance,
                     };
-                    let ev = append_notification(
-                        &mut guard.persisted,
+                    append_notification(
+                        &mut staged.persisted,
                         Utc::now(),
                         NotificationPayload::ConfirmedCommit {
                             confirm_event: "extend".to_string(),
@@ -1119,17 +1167,15 @@ impl DatastoreEngine {
                             session_id: Some(session_id),
                         },
                     );
-                    let _ = self.notif_tx.send(ev);
                 }
             } else {
-                // Finalizing the pending confirmed commit
                 let (changed_targets, resolved_meta) =
-                    promote_candidate_to_running(&mut guard, username, session_id, &meta);
-                guard.persisted.pending_commit = PendingCommitState::Idle;
+                    promote_candidate_to_running(&mut staged, username, session_id, &meta);
+                staged.persisted.pending_commit = PendingCommitState::Idle;
 
                 if !changed_targets.is_empty() {
-                    let ev_cc = append_notification(
-                        &mut guard.persisted,
+                    append_notification(
+                        &mut staged.persisted,
                         Utc::now(),
                         NotificationPayload::ConfigChange {
                             changed_by: ChangedBy::Session {
@@ -1144,10 +1190,9 @@ impl DatastoreEngine {
                             traceparent: resolved_meta.traceparent,
                         },
                     );
-                    let _ = self.notif_tx.send(ev_cc);
                 }
-                let ev_done = append_notification(
-                    &mut guard.persisted,
+                append_notification(
+                    &mut staged.persisted,
                     Utc::now(),
                     NotificationPayload::ConfirmedCommit {
                         confirm_event: "complete".to_string(),
@@ -1155,24 +1200,24 @@ impl DatastoreEngine {
                         session_id: Some(session_id),
                     },
                 );
-                let _ = self.notif_tx.send(ev_done);
             }
 
-            self.persist_with_wal(&guard.persisted, prev_len)
+            self.commit_staged(&mut guard, staged, prev_len)
                 .map_err(|e| NetconfError::operation_failed(e.to_string()))?;
             return Ok(());
         }
 
         // Case 2: Starting a new confirmed commit (<commit><confirmed/>...</commit>)
         if confirmed {
-            let prev_len = guard.persisted.notifications.len();
+            let prev_len = guard.snapshot.persisted.notifications.len();
+            let mut staged = guard.snapshot.clone();
             let (rollback_cells, rollback_du_ext, rollback_cu_objects, rollback_provenance) =
-                match &guard.persisted.pending_commit {
+                match &staged.persisted.pending_commit {
                     PendingCommitState::Idle => (
-                        guard.persisted.running_cells.clone(),
-                        guard.persisted.running_du_ext.clone(),
-                        guard.persisted.running_cu_objects.clone(),
-                        guard.persisted.running_provenance.clone(),
+                        staged.persisted.running_cells.clone(),
+                        staged.persisted.running_du_ext.clone(),
+                        staged.persisted.running_cu_objects.clone(),
+                        staged.persisted.running_provenance.clone(),
                     ),
                     PendingCommitState::Pending {
                         rollback_cells,
@@ -1188,9 +1233,9 @@ impl DatastoreEngine {
                     ),
                 };
             let (changed_targets, resolved_meta) =
-                promote_candidate_to_running(&mut guard, username, session_id, &meta);
+                promote_candidate_to_running(&mut staged, username, session_id, &meta);
             let deadline_ms = Utc::now().timestamp_millis() + (timeout_secs as i64 * 1000);
-            guard.persisted.pending_commit = PendingCommitState::Pending {
+            staged.persisted.pending_commit = PendingCommitState::Pending {
                 persist_id: persist,
                 owner_user: username.to_string(),
                 owner_session_id: session_id,
@@ -1202,8 +1247,8 @@ impl DatastoreEngine {
             };
 
             if !changed_targets.is_empty() {
-                let ev_cc = append_notification(
-                    &mut guard.persisted,
+                append_notification(
+                    &mut staged.persisted,
                     Utc::now(),
                     NotificationPayload::ConfigChange {
                         changed_by: ChangedBy::Session {
@@ -1218,11 +1263,10 @@ impl DatastoreEngine {
                         traceparent: resolved_meta.traceparent,
                     },
                 );
-                let _ = self.notif_tx.send(ev_cc);
             }
 
-            let ev_start = append_notification(
-                &mut guard.persisted,
+            append_notification(
+                &mut staged.persisted,
                 Utc::now(),
                 NotificationPayload::ConfirmedCommit {
                     confirm_event: "start".to_string(),
@@ -1230,27 +1274,27 @@ impl DatastoreEngine {
                     session_id: Some(session_id),
                 },
             );
-            let _ = self.notif_tx.send(ev_start);
 
-            self.persist_with_wal(&guard.persisted, prev_len)
+            self.commit_staged(&mut guard, staged, prev_len)
                 .map_err(|e| NetconfError::operation_failed(e.to_string()))?;
             return Ok(());
         }
 
         // Case 3: Plain <commit/> (completes non-persistent confirmed commit if same session, or commits candidate)
-        let prev_len = guard.persisted.notifications.len();
+        let prev_len = guard.snapshot.persisted.notifications.len();
+        let mut staged = guard.snapshot.clone();
         let was_pending = matches!(
-            &guard.persisted.pending_commit,
+            &staged.persisted.pending_commit,
             PendingCommitState::Pending { persist_id: None, owner_session_id, .. } if *owner_session_id == session_id
         );
         let (changed_targets, resolved_meta) =
-            promote_candidate_to_running(&mut guard, username, session_id, &meta);
+            promote_candidate_to_running(&mut staged, username, session_id, &meta);
         if was_pending {
-            guard.persisted.pending_commit = PendingCommitState::Idle;
+            staged.persisted.pending_commit = PendingCommitState::Idle;
         }
         if !changed_targets.is_empty() {
-            let ev_cc = append_notification(
-                &mut guard.persisted,
+            append_notification(
+                &mut staged.persisted,
                 Utc::now(),
                 NotificationPayload::ConfigChange {
                     changed_by: ChangedBy::Session {
@@ -1265,11 +1309,10 @@ impl DatastoreEngine {
                     traceparent: resolved_meta.traceparent,
                 },
             );
-            let _ = self.notif_tx.send(ev_cc);
         }
         if was_pending {
-            let ev_done = append_notification(
-                &mut guard.persisted,
+            append_notification(
+                &mut staged.persisted,
                 Utc::now(),
                 NotificationPayload::ConfirmedCommit {
                     confirm_event: "complete".to_string(),
@@ -1277,9 +1320,8 @@ impl DatastoreEngine {
                     session_id: Some(session_id),
                 },
             );
-            let _ = self.notif_tx.send(ev_done);
         }
-        self.persist_with_wal(&guard.persisted, prev_len)
+        self.commit_staged(&mut guard, staged, prev_len)
             .map_err(|e| NetconfError::operation_failed(e.to_string()))?;
         Ok(())
     }
@@ -1291,9 +1333,9 @@ impl DatastoreEngine {
         session_id: u64,
     ) -> Result<(), NetconfError> {
         let mut guard = self.inner.lock().await;
-        let prev_len = guard.persisted.notifications.len();
-        let (rollback_cells, rollback_du_ext, rollback_cu_objects, rollback_provenance, owner_user) =
-            match &guard.persisted.pending_commit {
+        let prev_len = guard.snapshot.persisted.notifications.len();
+        let (rollback_cells, rollback_du_ext, rollback_cu_objects, rollback_provenance) =
+            match &guard.snapshot.persisted.pending_commit {
                 PendingCommitState::Idle => {
                     return Err(NetconfError::invalid_value("No confirmed commit is pending"));
                 }
@@ -1326,64 +1368,29 @@ impl DatastoreEngine {
                         rollback_du_ext.clone(),
                         rollback_cu_objects.clone(),
                         rollback_provenance.clone(),
-                        owner_user.clone(),
                     )
                 }
             };
 
-        let changed_leaves = diff_changed_leaves(
-            &guard.persisted.running_cells,
-            &guard.persisted.running_du_ext,
-            &guard.persisted.running_cu_objects,
-            &rollback_cells,
-            &rollback_du_ext,
-            &rollback_cu_objects,
-        );
-        guard.persisted.running_cells = rollback_cells.clone();
-        guard.persisted.running_du_ext = rollback_du_ext.clone();
-        guard.persisted.running_cu_objects = rollback_cu_objects.clone();
-        guard.persisted.running_provenance = rollback_provenance.clone();
-        guard.candidate_cells = rollback_cells;
-        guard.candidate_du_ext = rollback_du_ext;
-        guard.candidate_cu_objects = rollback_cu_objects;
-        guard.candidate_provenance = rollback_provenance;
-        guard.candidate_dirty.clear();
-        guard.persisted.pending_commit = PendingCommitState::Idle;
-
-        let ev1 = append_notification(
-            &mut guard.persisted,
-            Utc::now(),
-            NotificationPayload::ConfirmedCommit {
-                confirm_event: "cancel".to_string(),
-                username: Some(username.to_string()),
-                session_id: Some(session_id),
+        let mut staged = guard.snapshot.clone();
+        apply_rollback_snapshot(
+            &mut staged,
+            rollback_cells,
+            rollback_du_ext,
+            rollback_cu_objects,
+            rollback_provenance,
+            "cancel",
+            username,
+            session_id,
+            ChangedBy::Session {
+                username: username.to_string(),
+                session_id,
+                source_host: None,
             },
+            WriterOrigin::O1Client,
+            false,
         );
-        let _ = self.notif_tx.send(ev1);
-
-        if !changed_leaves.is_empty() {
-            let changed_targets: Vec<String> =
-                changed_leaves.into_iter().map(|(_, p)| p).collect();
-            let ev2 = append_notification(
-                &mut guard.persisted,
-                Utc::now(),
-                NotificationPayload::ConfigChange {
-                    changed_by: ChangedBy::Session {
-                        username: username.to_string(),
-                        session_id,
-                        source_host: None,
-                    },
-                    datastore: "running".to_string(),
-                    targets: changed_targets,
-                    writer_origin: WriterOrigin::O1Client,
-                    tx_id: None,
-                    traceparent: None,
-                },
-            );
-            let _ = self.notif_tx.send(ev2);
-        }
-        let _ = owner_user;
-        self.persist_with_wal(&guard.persisted, prev_len)
+        self.commit_staged(&mut guard, staged, prev_len)
             .map_err(|e| NetconfError::operation_failed(e.to_string()))?;
         Ok(())
     }
@@ -1392,16 +1399,42 @@ impl DatastoreEngine {
         &self,
         start_time: Option<DateTime<Utc>>,
     ) -> (Vec<NotificationRecord>, broadcast::Receiver<NotificationRecord>) {
+        let (replayed, _, rx) = self.replay_and_subscribe_with_watermark(start_time).await;
+        (replayed, rx)
+    }
+
+    pub async fn replay_and_subscribe_with_watermark(
+        &self,
+        start_time: Option<DateTime<Utc>>,
+    ) -> (Vec<NotificationRecord>, u64, broadcast::Receiver<NotificationRecord>) {
         let guard = self.inner.lock().await;
         let rx = self.notif_tx.subscribe();
         let replayed: Vec<NotificationRecord> = guard
+            .snapshot
             .persisted
             .notifications
             .iter()
             .filter(|n| start_time.map(|st| n.event_time >= st).unwrap_or(false))
             .cloned()
             .collect();
-        (replayed, rx)
+        let watermark = replayed
+            .last()
+            .map(|r| r.seq)
+            .unwrap_or_else(|| guard.snapshot.persisted.notifications.last().map(|r| r.seq).unwrap_or(0));
+        (replayed, watermark, rx)
+    }
+
+    /// Fetch all durable `NotificationRecord`s with `seq > after_seq` in order (used for lag recovery).
+    pub async fn notifications_after_seq(&self, after_seq: u64) -> Vec<NotificationRecord> {
+        let guard = self.inner.lock().await;
+        guard
+            .snapshot
+            .persisted
+            .notifications
+            .iter()
+            .filter(|r| r.seq > after_seq)
+            .cloned()
+            .collect()
     }
 }
 
@@ -1667,8 +1700,84 @@ fn validate_object_edit(edit: &ObjectEdit) -> Result<(), NetconfError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_rollback_snapshot(
+    staged: &mut DatastoreSnapshot,
+    rollback_cells: BTreeMap<String, String>,
+    rollback_du_ext: BTreeMap<String, ManagedAttributes>,
+    rollback_cu_objects: BTreeMap<String, CuObjectRecord>,
+    rollback_provenance: BTreeMap<String, LeafProvenance>,
+    confirm_event: &str,
+    owner_user: &str,
+    owner_session_id: u64,
+    changed_by: ChangedBy,
+    writer_origin: WriterOrigin,
+    record_server_provenance: bool,
+) {
+    let changed_leaves = diff_changed_leaves(
+        &staged.persisted.running_cells,
+        &staged.persisted.running_du_ext,
+        &staged.persisted.running_cu_objects,
+        &rollback_cells,
+        &rollback_du_ext,
+        &rollback_cu_objects,
+    );
+    let now = Utc::now();
+    staged.persisted.running_cells = rollback_cells.clone();
+    staged.persisted.running_du_ext = rollback_du_ext.clone();
+    staged.persisted.running_cu_objects = rollback_cu_objects.clone();
+    staged.persisted.running_provenance = rollback_provenance;
+    if record_server_provenance {
+        for (prov_key, _) in &changed_leaves {
+            staged
+                .persisted
+                .running_provenance
+                .entry(prov_key.clone())
+                .or_insert_with(|| LeafProvenance {
+                    owner_principal: "server".to_string(),
+                    owner_session_id: 0,
+                    writer_origin,
+                    tx_id: None,
+                    traceparent: None,
+                    updated_at: now,
+                });
+        }
+    }
+    staged.candidate_cells = rollback_cells;
+    staged.candidate_du_ext = rollback_du_ext;
+    staged.candidate_cu_objects = rollback_cu_objects;
+    staged.candidate_provenance = staged.persisted.running_provenance.clone();
+    staged.candidate_dirty.clear();
+    staged.persisted.pending_commit = PendingCommitState::Idle;
+
+    append_notification(
+        &mut staged.persisted,
+        now,
+        NotificationPayload::ConfirmedCommit {
+            confirm_event: confirm_event.to_string(),
+            username: Some(owner_user.to_string()),
+            session_id: Some(owner_session_id),
+        },
+    );
+    if !changed_leaves.is_empty() {
+        let changed_targets: Vec<String> = changed_leaves.into_iter().map(|(_, p)| p).collect();
+        append_notification(
+            &mut staged.persisted,
+            now,
+            NotificationPayload::ConfigChange {
+                changed_by,
+                datastore: "running".to_string(),
+                targets: changed_targets,
+                writer_origin,
+                tx_id: None,
+                traceparent: None,
+            },
+        );
+    }
+}
+
 fn apply_edits_to_candidate(
-    guard: &mut InnerState,
+    snap: &mut DatastoreSnapshot,
     edits: &[ObjectEdit],
     prov: &LeafProvenance,
 ) {
@@ -1676,33 +1785,33 @@ fn apply_edits_to_candidate(
         match edit.kind {
             ManagedFunctionKind::NRCellDU => {
                 if let Some(ref st) = edit.administrative_state {
-                    guard.candidate_cells.insert(edit.id.clone(), st.clone());
+                    snap.candidate_cells.insert(edit.id.clone(), st.clone());
                     let k = leaf_prov_key(edit.kind, &edit.id, "administrativeState");
-                    guard.candidate_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_dirty.insert(k);
+                    snap.candidate_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_dirty.insert(k);
                 }
                 if edit.gpu_accelerator_profile.is_some() || edit.ai_rrm_policy_id.is_some() {
-                    let ext = guard
+                    let ext = snap
                         .candidate_du_ext
                         .entry(edit.id.clone())
                         .or_default();
                     if let Some(ref g) = edit.gpu_accelerator_profile {
                         ext.gpu_accelerator_profile = Some(g.clone());
                         let k = leaf_prov_key(edit.kind, &edit.id, "gpuAcceleratorProfile");
-                        guard.candidate_provenance.insert(k.clone(), prov.clone());
-                        guard.candidate_dirty.insert(k);
+                        snap.candidate_provenance.insert(k.clone(), prov.clone());
+                        snap.candidate_dirty.insert(k);
                     }
                     if let Some(ref p) = edit.ai_rrm_policy_id {
                         ext.ai_rrm_policy_id = Some(p.clone());
                         let k = leaf_prov_key(edit.kind, &edit.id, "aiRrmPolicyId");
-                        guard.candidate_provenance.insert(k.clone(), prov.clone());
-                        guard.candidate_dirty.insert(k);
+                        snap.candidate_provenance.insert(k.clone(), prov.clone());
+                        snap.candidate_dirty.insert(k);
                     }
                 }
             }
             kind => {
                 let obj_key = cu_object_key(kind, &edit.id);
-                let rec = guard
+                let rec = snap
                     .candidate_cu_objects
                     .entry(obj_key)
                     .or_insert_with(|| CuObjectRecord {
@@ -1713,20 +1822,20 @@ fn apply_edits_to_candidate(
                 if let Some(ref st) = edit.administrative_state {
                     rec.attrs.administrative_state = Some(st.clone());
                     let k = leaf_prov_key(kind, &edit.id, "administrativeState");
-                    guard.candidate_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_dirty.insert(k);
+                    snap.candidate_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_dirty.insert(k);
                 }
                 if let Some(ref g) = edit.gpu_accelerator_profile {
                     rec.attrs.gpu_accelerator_profile = Some(g.clone());
                     let k = leaf_prov_key(kind, &edit.id, "gpuAcceleratorProfile");
-                    guard.candidate_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_dirty.insert(k);
+                    snap.candidate_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_dirty.insert(k);
                 }
                 if let Some(ref p) = edit.ai_rrm_policy_id {
                     rec.attrs.ai_rrm_policy_id = Some(p.clone());
                     let k = leaf_prov_key(kind, &edit.id, "aiRrmPolicyId");
-                    guard.candidate_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_dirty.insert(k);
+                    snap.candidate_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_dirty.insert(k);
                 }
             }
         }
@@ -1734,7 +1843,7 @@ fn apply_edits_to_candidate(
 }
 
 fn apply_edits_to_running(
-    guard: &mut InnerState,
+    snap: &mut DatastoreSnapshot,
     edits: &[ObjectEdit],
     prov: &LeafProvenance,
 ) -> Vec<String> {
@@ -1743,24 +1852,24 @@ fn apply_edits_to_running(
         match edit.kind {
             ManagedFunctionKind::NRCellDU => {
                 if let Some(ref st) = edit.administrative_state {
-                    let prev = guard.persisted.running_cells.get(&edit.id).cloned();
-                    guard.persisted.running_cells.insert(edit.id.clone(), st.clone());
-                    guard.candidate_cells.insert(edit.id.clone(), st.clone());
+                    let prev = snap.persisted.running_cells.get(&edit.id).cloned();
+                    snap.persisted.running_cells.insert(edit.id.clone(), st.clone());
+                    snap.candidate_cells.insert(edit.id.clone(), st.clone());
                     let k = leaf_prov_key(edit.kind, &edit.id, "administrativeState");
-                    guard.persisted.running_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_dirty.remove(&k);
+                    snap.persisted.running_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_dirty.remove(&k);
                     if prev.as_deref() != Some(st.as_str()) {
                         changed_targets.push(leaf_target_path(edit.kind, &edit.id, "administrativeState"));
                     }
                 }
                 if edit.gpu_accelerator_profile.is_some() || edit.ai_rrm_policy_id.is_some() {
-                    let run_ext = guard
+                    let run_ext = snap
                         .persisted
                         .running_du_ext
                         .entry(edit.id.clone())
                         .or_default();
-                    let cand_ext = guard
+                    let cand_ext = snap
                         .candidate_du_ext
                         .entry(edit.id.clone())
                         .or_default();
@@ -1771,9 +1880,9 @@ fn apply_edits_to_running(
                         run_ext.gpu_accelerator_profile = Some(g.clone());
                         cand_ext.gpu_accelerator_profile = Some(g.clone());
                         let k = leaf_prov_key(edit.kind, &edit.id, "gpuAcceleratorProfile");
-                        guard.persisted.running_provenance.insert(k.clone(), prov.clone());
-                        guard.candidate_provenance.insert(k.clone(), prov.clone());
-                        guard.candidate_dirty.remove(&k);
+                        snap.persisted.running_provenance.insert(k.clone(), prov.clone());
+                        snap.candidate_provenance.insert(k.clone(), prov.clone());
+                        snap.candidate_dirty.remove(&k);
                     }
                     if let Some(ref p) = edit.ai_rrm_policy_id {
                         if run_ext.ai_rrm_policy_id.as_deref() != Some(p.as_str()) {
@@ -1782,15 +1891,15 @@ fn apply_edits_to_running(
                         run_ext.ai_rrm_policy_id = Some(p.clone());
                         cand_ext.ai_rrm_policy_id = Some(p.clone());
                         let k = leaf_prov_key(edit.kind, &edit.id, "aiRrmPolicyId");
-                        guard.persisted.running_provenance.insert(k.clone(), prov.clone());
-                        guard.candidate_provenance.insert(k.clone(), prov.clone());
-                        guard.candidate_dirty.remove(&k);
+                        snap.persisted.running_provenance.insert(k.clone(), prov.clone());
+                        snap.candidate_provenance.insert(k.clone(), prov.clone());
+                        snap.candidate_dirty.remove(&k);
                     }
                 }
             }
             kind => {
                 let obj_key = cu_object_key(kind, &edit.id);
-                let run_rec = guard
+                let run_rec = snap
                     .persisted
                     .running_cu_objects
                     .entry(obj_key.clone())
@@ -1799,7 +1908,7 @@ fn apply_edits_to_running(
                         id: edit.id.clone(),
                         attrs: ManagedAttributes::default(),
                     });
-                let cand_rec = guard
+                let cand_rec = snap
                     .candidate_cu_objects
                     .entry(obj_key)
                     .or_insert_with(|| CuObjectRecord {
@@ -1814,9 +1923,9 @@ fn apply_edits_to_running(
                     run_rec.attrs.administrative_state = Some(st.clone());
                     cand_rec.attrs.administrative_state = Some(st.clone());
                     let k = leaf_prov_key(kind, &edit.id, "administrativeState");
-                    guard.persisted.running_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_dirty.remove(&k);
+                    snap.persisted.running_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_dirty.remove(&k);
                 }
                 if let Some(ref g) = edit.gpu_accelerator_profile {
                     if run_rec.attrs.gpu_accelerator_profile.as_deref() != Some(g.as_str()) {
@@ -1825,9 +1934,9 @@ fn apply_edits_to_running(
                     run_rec.attrs.gpu_accelerator_profile = Some(g.clone());
                     cand_rec.attrs.gpu_accelerator_profile = Some(g.clone());
                     let k = leaf_prov_key(kind, &edit.id, "gpuAcceleratorProfile");
-                    guard.persisted.running_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_dirty.remove(&k);
+                    snap.persisted.running_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_dirty.remove(&k);
                 }
                 if let Some(ref p) = edit.ai_rrm_policy_id {
                     if run_rec.attrs.ai_rrm_policy_id.as_deref() != Some(p.as_str()) {
@@ -1836,9 +1945,9 @@ fn apply_edits_to_running(
                     run_rec.attrs.ai_rrm_policy_id = Some(p.clone());
                     cand_rec.attrs.ai_rrm_policy_id = Some(p.clone());
                     let k = leaf_prov_key(kind, &edit.id, "aiRrmPolicyId");
-                    guard.persisted.running_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_provenance.insert(k.clone(), prov.clone());
-                    guard.candidate_dirty.remove(&k);
+                    snap.persisted.running_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_provenance.insert(k.clone(), prov.clone());
+                    snap.candidate_dirty.remove(&k);
                 }
             }
         }
@@ -1943,18 +2052,18 @@ fn diff_changed_leaves(
 }
 
 fn promote_candidate_to_running(
-    guard: &mut InnerState,
+    snap: &mut DatastoreSnapshot,
     username: &str,
     session_id: u64,
     commit_meta: &WriteMeta,
 ) -> (Vec<String>, WriteMeta) {
     let changed_leaves = diff_changed_leaves(
-        &guard.persisted.running_cells,
-        &guard.persisted.running_du_ext,
-        &guard.persisted.running_cu_objects,
-        &guard.candidate_cells,
-        &guard.candidate_du_ext,
-        &guard.candidate_cu_objects,
+        &snap.persisted.running_cells,
+        &snap.persisted.running_du_ext,
+        &snap.persisted.running_cu_objects,
+        &snap.candidate_cells,
+        &snap.candidate_du_ext,
+        &snap.candidate_cu_objects,
     );
     let now = Utc::now();
     let mut resolved_tx = commit_meta.tx_id.clone();
@@ -1962,22 +2071,22 @@ fn promote_candidate_to_running(
     let mut resolved_origin = commit_meta.writer_origin;
 
     let before_snap = collect_leaf_snapshot(
-        &guard.persisted.running_cells,
-        &guard.persisted.running_du_ext,
-        &guard.persisted.running_cu_objects,
+        &snap.persisted.running_cells,
+        &snap.persisted.running_du_ext,
+        &snap.persisted.running_cu_objects,
     );
     let after_snap = collect_leaf_snapshot(
-        &guard.candidate_cells,
-        &guard.candidate_du_ext,
-        &guard.candidate_cu_objects,
+        &snap.candidate_cells,
+        &snap.candidate_du_ext,
+        &snap.candidate_cu_objects,
     );
 
     for (leaf_key, (_, new_val)) in &after_snap {
         let old_val = before_snap.get(leaf_key).and_then(|(_, v)| v.as_ref());
         let value_changed = old_val != new_val.as_ref();
-        let dirty = guard.candidate_dirty.contains(leaf_key);
+        let dirty = snap.candidate_dirty.contains(leaf_key);
         if value_changed || dirty {
-            let cand_prov = guard.candidate_provenance.get(leaf_key);
+            let cand_prov = snap.candidate_provenance.get(leaf_key);
             let tx_id = commit_meta
                 .tx_id
                 .clone()
@@ -2008,18 +2117,18 @@ fn promote_candidate_to_running(
                 traceparent,
                 updated_at: now,
             };
-            guard
+            snap
                 .persisted
                 .running_provenance
                 .insert(leaf_key.clone(), prov.clone());
-            guard.candidate_provenance.insert(leaf_key.clone(), prov);
+            snap.candidate_provenance.insert(leaf_key.clone(), prov);
         }
     }
 
-    guard.persisted.running_cells = guard.candidate_cells.clone();
-    guard.persisted.running_du_ext = guard.candidate_du_ext.clone();
-    guard.persisted.running_cu_objects = guard.candidate_cu_objects.clone();
-    guard.candidate_dirty.clear();
+    snap.persisted.running_cells = snap.candidate_cells.clone();
+    snap.persisted.running_du_ext = snap.candidate_du_ext.clone();
+    snap.persisted.running_cu_objects = snap.candidate_cu_objects.clone();
+    snap.candidate_dirty.clear();
     let changed_targets: Vec<String> = changed_leaves.into_iter().map(|(_, p)| p).collect();
     (
         changed_targets,
@@ -2152,6 +2261,16 @@ pub fn render_datastore_xml_with_provenance(
     xml
 }
 
+fn sync_parent_dir(target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            let dir = File::open(parent)?;
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 fn atomic_write_json<T: Serialize>(target: &Path, value: &T) -> Result<()> {
     let tmp = target.with_extension("json.tmp");
     let data = serde_json::to_vec_pretty(value)?;
@@ -2161,6 +2280,7 @@ fn atomic_write_json<T: Serialize>(target: &Path, value: &T) -> Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, target)?;
+    sync_parent_dir(target)?;
     Ok(())
 }
 
@@ -2713,5 +2833,149 @@ mod tests {
         assert!(last_xml.contains("<changed-by><server/></changed-by>"));
         assert!(last_xml.contains("<writer-origin>server-rollback</writer-origin>"));
         assert!(eng2.verify_audit_chain().await.valid);
+    }
+
+    #[tokio::test]
+    async fn persistence_boundary_rejects_snapshot_and_redb_failures_without_notifying_or_mutating() {
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("state.json");
+        let eng = DatastoreEngine::open(&state_file, false).unwrap();
+        let sid = eng.allocate_session_id().await.unwrap();
+        let (_, mut live_rx) = eng.replay_and_subscribe(None).await;
+
+        // 1. Inject FailSnapshot on direct running edit -> operation-failed, zero live notif, state stays LOCKED
+        eng.set_fail_next_persist(FailPersistMode::FailSnapshot);
+        let err1 = eng
+            .edit_config("running", "cell-1", "UNLOCKED", "smo", sid, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err1.error_tag, "operation-failed");
+        assert!(live_rx.try_recv().is_err());
+        assert!(eng.get_config_xml("running").await.unwrap().contains("LOCKED"));
+
+        // 2. Inject FailRedb on candidate + commit -> operation-failed, zero live notif, state stays LOCKED
+        eng.edit_config("candidate", "cell-1", "UNLOCKED", "smo", sid, None)
+            .await
+            .unwrap();
+        eng.set_fail_next_persist(FailPersistMode::FailRedb);
+        let err2 = eng
+            .commit(false, 300, None, None, "smo", sid, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err2.error_tag, "operation-failed");
+        assert!(live_rx.try_recv().is_err());
+        assert!(eng.get_config_xml("running").await.unwrap().contains("LOCKED"));
+
+        // Reopen from disk and confirm zero phantom records were persisted
+        drop(eng);
+        let eng_reopen = DatastoreEngine::open(&state_file, false).unwrap();
+        assert!(eng_reopen.get_config_xml("running").await.unwrap().contains("LOCKED"));
+        let (replayed_zero, mut live_rx2) = eng_reopen
+            .replay_and_subscribe(Some(DateTime::from_timestamp(0, 0).unwrap()))
+            .await;
+        assert!(replayed_zero.is_empty());
+
+        // 3. Normal success path produces exactly one logical ConfigChange record
+        let sid2 = eng_reopen.allocate_session_id().await.unwrap();
+        eng_reopen
+            .edit_config("running", "cell-1", "UNLOCKED", "smo", sid2, None)
+            .await
+            .unwrap();
+        let live_ev = live_rx2.try_recv().expect("exactly one live ConfigChange expected");
+        assert!(live_rx2.try_recv().is_err());
+        assert_eq!(live_ev.seq, 1);
+
+        // 4. Simulate crash after authoritative redb commit where state.json lags behind redb commit_seq
+        let stale_json = PersistedStore::default(); // commit_seq == 0, cell-1 == LOCKED
+        fs::write(&state_file, serde_json::to_vec_pretty(&stale_json).unwrap()).unwrap();
+        drop(eng_reopen);
+
+        let eng_reconciled = DatastoreEngine::open(&state_file, false).unwrap();
+        assert!(eng_reconciled
+            .get_config_xml("running")
+            .await
+            .unwrap()
+            .contains("UNLOCKED"));
+        assert!(eng_reconciled.verify_audit_chain().await.valid);
+    }
+
+    #[tokio::test]
+    async fn three_boundary_multi_cell_concurrent_writer_isolates_cell1_from_cell2() {
+        let dir = tempdir().unwrap();
+        let state_file = dir.path().join("state.json");
+        let eng = DatastoreEngine::open(&state_file, false).unwrap();
+        let sid_smo = eng.allocate_session_id().await.unwrap();
+        let sid_ops2 = eng.allocate_session_id().await.unwrap();
+
+        // SMO commits cell-1 = UNLOCKED (simulating lost reply before reconnect)
+        eng.edit_config_with_meta(
+            "candidate",
+            "cell-1",
+            "UNLOCKED",
+            "smo",
+            sid_smo,
+            Some("127.0.0.1".into()),
+            WriteMeta {
+                tx_id: Some("tx-smo-cell1".into()),
+                traceparent: None,
+                writer_origin: WriterOrigin::O1Client,
+            },
+        )
+        .await
+        .unwrap();
+        eng.commit(
+            true,
+            300,
+            Some("cell1-tok".into()),
+            None,
+            "smo",
+            sid_smo,
+            Some("127.0.0.1".into()),
+        )
+        .await
+        .unwrap();
+
+        // Before SMO reconnects, competing writer ops2 modifies unrelated cell-2 = UNLOCKED on running
+        eng.edit_config_with_meta(
+            "running",
+            "cell-2",
+            "UNLOCKED",
+            "ops2",
+            sid_ops2,
+            Some("127.0.0.1".into()),
+            WriteMeta {
+                tx_id: Some("tx-ops2-cell2".into()),
+                traceparent: None,
+                writer_origin: WriterOrigin::O1Client,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Both per-leaf provenance and target-specific RFC 6470 replay isolate cell-1 (smo) from cell-2 (ops2)
+        let prov_xml = eng.get_config_xml_with_provenance("running", true).await.unwrap();
+        assert!(prov_xml.contains(&format!(
+            "<NRCellDU><id>cell-1</id><attributes><administrativeState xmlns:o1p=\"{PROVENANCE_NS}\" o1p:owner=\"smo\""
+        )));
+        assert!(prov_xml.contains(&format!(
+            "<NRCellDU><id>cell-2</id><attributes><administrativeState xmlns:o1p=\"{PROVENANCE_NS}\" o1p:owner=\"ops2\""
+        )));
+
+        let (events, _) = eng
+            .replay_and_subscribe(Some(DateTime::from_timestamp(0, 0).unwrap()))
+            .await;
+        let cell1_events: Vec<&NotificationRecord> = events
+            .iter()
+            .filter(|r| match &r.payload {
+                NotificationPayload::ConfigChange { targets, .. } => {
+                    targets.iter().any(|t| t.contains("NRCellDU[id='cell-1']"))
+                }
+                _ => false,
+            })
+            .collect();
+        assert_eq!(cell1_events.len(), 1);
+        assert!(cell1_events[0]
+            .to_notification_xml()
+            .contains(&format!("<username>smo</username><session-id>{sid_smo}</session-id>")));
     }
 }
